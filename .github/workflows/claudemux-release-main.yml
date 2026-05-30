@@ -1,0 +1,78 @@
+name: claudemux release main
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: claudemux-release-main
+
+permissions:
+  contents: write
+
+# GA runs as the bot (commit + push to main). HUSKY=0 disables the local
+# pre-push changeset hook for the same reason as release-next: the GA commit
+# touches release-surface files whose changesets are already consumed.
+env:
+  HUSKY: "0"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create claudemux release app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CLAUDEMUX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.CLAUDEMUX_RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          ref: main
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace tooling
+        run: pnpm install --frozen-lockfile
+
+      - name: Exit pre mode, version, and push GA
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # GA only fires when main is carrying prerelease state promoted from
+          # next (.changeset/pre.json with mode=pre). `version-ga` runs
+          # `changeset pre exit && changeset version`, which deletes pre.json, so
+          # the bot's own GA commit re-triggers this workflow with no pre.json —
+          # the guard below then exits 0. That is the loop break.
+          if [ ! -f .changeset/pre.json ] || [ "$(jq -r '.mode // ""' .changeset/pre.json)" != "pre" ]; then
+            echo 'main is not in prerelease mode; nothing to promote.'
+            exit 0
+          fi
+
+          pnpm --dir plugins/claudemux version-ga
+
+          v=$(jq -r .version plugins/claudemux/package.json)
+          case "$v" in
+            *-beta*)
+              echo "::error::GA produced a beta version $v"
+              exit 1
+              ;;
+          esac
+
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git config user.name 'github-actions[bot]'
+          git add -A
+          git diff --staged --quiet && echo 'Nothing to commit.' && exit 0
+          git commit -m "chore(release): claudemux ${v} GA"
+          git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main

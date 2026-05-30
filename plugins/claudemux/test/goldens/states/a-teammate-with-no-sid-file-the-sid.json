@@ -1,0 +1,5 @@
+{
+  "code": 0,
+  "stdout": "NAME                             REPO  WORKTREE  ENGINE  STATE    LAST  PREVIEW\nclaudemux-conftest-0dc498a566d7  -     -         claude  unknown  -     -\n",
+  "stderr": ""
+}

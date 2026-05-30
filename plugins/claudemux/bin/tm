@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# tm — the dispatcher's CLI: tmux teammate manager, plus task-ledger and
+# context-usage helpers for dispatcher bookkeeping.
+#
+# This launcher runs the TypeScript sources under `../src/` directly through
+# Node 22's experimental type-transform pipeline. There is no build step and
+# no `npm install`: the only runtime npm dependency, `ws`, is vendored under
+# `../third_party/ws/` and consumed via the `#ws` subpath in
+# `../package.json`'s `imports` map. A small ESM resolve hook
+# (`../resolver-register.mjs`) lets the type-stripper accept the tree's
+# extension-less and `.js` import specifiers (the codex-protocol bindings
+# are generator output we do not rewrite).
+#
+# Requirements: Node 22.7 or newer (`--experimental-transform-types` ships
+# in 22.7, and the vendored `ws` consumes its CJS lib files via the upstream
+# ESM `wrapper.mjs`, which has been supported well before that). The
+# `--no-warnings` flag suppresses the per-launch `ExperimentalWarning` Node
+# emits for the type-transform flag.
+
+set -eu
+
+# Follow the script's own symlink chain. BSD `readlink` (macOS) has no `-f`,
+# so we loop manually — necessary when a user symlinks this launcher into
+# their PATH (`ln -s .../plugins/claudemux/bin/tm ~/.local/bin/tm`): a plain
+# `dirname "$0"` resolves to the symlink's directory, not the real script's,
+# and the relative `../core/...` lookups miss.
+SCRIPT="$0"
+while [[ -L "$SCRIPT" ]]; do
+    LINK_DIR="$(cd "$(dirname "$SCRIPT")" && pwd -P)"
+    LINK_TARGET="$(readlink "$SCRIPT")"
+    if [[ "$LINK_TARGET" = /* ]]; then
+        SCRIPT="$LINK_TARGET"
+    else
+        SCRIPT="$LINK_DIR/$LINK_TARGET"
+    fi
+done
+HERE="$(cd "$(dirname "$SCRIPT")" && pwd -P)"
+ROOT="$HERE/.."
+ENTRY="$ROOT/src/main.ts"
+REGISTER="$ROOT/resolver-register.mjs"
+
+if ! command -v node >/dev/null 2>&1; then
+    echo "tm: node not found on PATH. Install Node 22.7+ (https://nodejs.org/) and try again." >&2
+    exit 1
+fi
+
+# Reject older Node versions with an actionable message — otherwise the user
+# hits an opaque "invalid option: --experimental-transform-types" from a
+# Node that does not know the flag. The vendored `#ws` path goes through
+# the upstream `wrapper.mjs`, which ESM-imports the CJS lib files; that
+# direction has been supported since well before 22.7, so this guard's
+# only constraint is the transform-types flag itself (22.7+).
+NODE_VERSION="$(node -p 'process.versions.node' 2>/dev/null || echo 0.0.0)"
+NODE_MAJOR="${NODE_VERSION%%.*}"
+NODE_REST="${NODE_VERSION#*.}"
+NODE_MINOR="${NODE_REST%%.*}"
+if [[ "$NODE_MAJOR" -lt 22 ]] || { [[ "$NODE_MAJOR" -eq 22 ]] && [[ "$NODE_MINOR" -lt 7 ]]; }; then
+    echo "tm: requires Node 22.7 or newer (found v$NODE_VERSION). Upgrade Node and try again." >&2
+    exit 1
+fi
+
+if [[ ! -f "$ENTRY" ]]; then
+    echo "tm: orchestration entry missing at $ENTRY — expected the plugin's src/ tree alongside this launcher." >&2
+    exit 1
+fi
+
+if [[ ! -f "$REGISTER" ]]; then
+    echo "tm: resolver hook missing at $REGISTER — expected at the plugin root." >&2
+    exit 1
+fi
+
+exec node \
+    --import "$REGISTER" \
+    --experimental-transform-types \
+    --no-warnings \
+    "$ENTRY" "$@"

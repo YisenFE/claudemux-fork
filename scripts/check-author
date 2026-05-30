@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# check-author — validate one git author email.
+#
+# Single source of truth for the author-identity rule. Two callers share it:
+#   - .husky/pre-commit          checks the identity the next commit would use.
+#   - .github/workflows/ci.yml   checks every commit a push or PR introduces.
+#
+# Usage:  scripts/check-author <email>
+# Exit:   0  the email is a real, well-formed address.
+#         1  unparseable, or a machine-default identity (git's
+#            whoami@hostname guess) — reason printed to stderr.
+
+set -euo pipefail
+
+email="${1:-}"
+
+# Format gate: gitlint's pragmatic default — name@domain.tld, no spaces.
+# A bare hostname (user@MacBook) has no dot and fails here.
+if ! grep -Eq '^[^@ ]+@[^@ ]+\.[^@ ]+$' <<< "$email"; then
+  echo "check-author: not a valid email address: '$email'" >&2
+  exit 1
+fi
+
+# Blacklist mDNS / LAN suffixes — git guesses whoami@hostname (landing on
+# these) when user.email is unset.
+case "$email" in
+  *@*.local|*@*.localdomain|*@*.lan|*@*.home|*@*.internal)
+    echo "check-author: '$email' looks like a machine-default identity" >&2
+    exit 1 ;;
+esac

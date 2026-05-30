@@ -1,0 +1,13 @@
+{
+  "name": "ws",
+  "version": "8.21.0",
+  "description": "Vendored copy of websockets/ws@8.21.0 (MIT). Origin: https://github.com/websockets/ws/tree/8.21.0. See LICENSE.",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "import": "./wrapper.mjs",
+      "require": "./index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}

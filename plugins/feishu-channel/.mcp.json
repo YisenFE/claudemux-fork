@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "feishu": {
+      "command": "npm",
+      "args": ["--prefix", "${CLAUDE_PLUGIN_ROOT}", "--silent", "run", "start"],
+      "env": {
+        "HTTP_PROXY": "",
+        "HTTPS_PROXY": "",
+        "http_proxy": "",
+        "https_proxy": ""
+      }
+    }
+  }
+}

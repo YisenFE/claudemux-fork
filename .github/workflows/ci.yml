@@ -1,0 +1,262 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  claudemux-changeset-status:
+    # Authored-PR gate: every PR into next that touches a release surface must
+    # declare a changeset. PRs into main are promotions (next -> main), which
+    # carry no new changeset, so they are excluded.
+    if: >
+      github.event_name == 'pull_request' &&
+      github.base_ref != 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace tooling
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch PR base
+        run: git fetch origin "${{ github.base_ref }}" --depth=1
+
+      - name: Changeset declaration check
+        run: pnpm changeset status --since="origin/${{ github.base_ref }}"
+
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Commit author check
+        run: |
+          zero=0000000000000000000000000000000000000000
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            commits=$(git log --format='%H' \
+              "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}")
+          elif [ "${{ github.event.before }}" = "$zero" ]; then
+            commits=$(git log -1 --format='%H' "${{ github.event.after }}")
+          else
+            commits=$(git log --format='%H' \
+              "${{ github.event.before }}..${{ github.event.after }}")
+          fi
+          fail=0
+          while IFS= read -r c; do
+            [ -z "$c" ] && continue
+            email=$(git log -1 --format='%ae' "$c")
+            scripts/check-author "$email" || { echo "  ^ in commit $c" >&2; fail=1; }
+          done <<< "$commits"
+          [ "$fail" = 0 ] || { echo "::error::commit author email check failed"; exit 1; }
+
+      - name: Install tmux + bats + shellcheck (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux bats shellcheck jq
+
+      - name: Install tmux + bats + shellcheck (macos)
+        if: runner.os == 'macOS'
+        run: brew install bats-core shellcheck tmux jq
+
+      - name: Versions
+        run: |
+          tmux -V
+          bats --version
+          shellcheck --version | head -2
+          bash --version | head -1
+
+      - name: shellcheck
+        run: |
+          shellcheck \
+            plugins/claudemux/bin/tm \
+            plugins/claudemux/test/fixtures/fake-tmux-bin/tmux \
+            plugins/claudemux/hooks/*.sh \
+            plugins/claudemux/scripts/*.sh \
+            scripts/check-author \
+            .husky/pre-commit \
+            .husky/pre-push \
+            .agents/scripts/check.sh
+
+      - name: agents — KB structural check
+        run: bash .agents/scripts/check.sh
+
+      - name: setup.sh conformance
+        # test-setup.sh git-inits a throwaway .workspace/ in each scenario.
+        # Runners without a default git identity would hit setup.sh's
+        # graceful "commit failed" path; setting an identity here forces
+        # the full init → commit chain to run, so a regression in the
+        # happy-path commit logic surfaces in CI.
+        env:
+          GIT_AUTHOR_NAME: claudemux-ci
+          GIT_AUTHOR_EMAIL: claudemux-ci@users.noreply.github.com
+          GIT_COMMITTER_NAME: claudemux-ci
+          GIT_COMMITTER_EMAIL: claudemux-ci@users.noreply.github.com
+        run: bash plugins/claudemux/scripts/test-setup.sh
+
+      - name: bats — release tooling
+        if: hashFiles('plugins/claudemux/test/cli/*.bats') != ''
+        run: bats plugins/claudemux/test/cli/
+
+  # The feishu-channel plugin is a Node/TypeScript project with its own unit
+  # suite. It runs in a separate job so its toolchain stays off the bats +
+  # shellcheck lane above. The suite is OS-agnostic TypeScript, so ubuntu alone
+  # is enough coverage.
+  feishu-channel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Versions
+        run: node --version
+
+      - name: Type-check
+        run: pnpm --filter claude-channel-feishu run typecheck
+
+      - name: Unit tests
+        run: pnpm --filter claude-channel-feishu run test
+
+      # A live check against the real Feishu Open Platform: the credentials
+      # mint a tenant_access_token and a WSClient opens the long-lived
+      # WebSocket. test/feishu-live.ts is not a *.test.ts file, so `npm test`
+      # above never runs it — it runs here, by explicit path, with the app
+      # credentials from repository secrets. When the secrets are absent (a
+      # fork pull request), the test skips itself rather than failing.
+      - name: Live Feishu integration test
+        working-directory: plugins/feishu-channel
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: pnpm exec vitest run --config vitest.live.config.ts
+
+  # The claudemux plugin's TypeScript suite. Runs in a separate job from the
+  # bats + shellcheck lane above so the Node toolchain stays off that lane.
+  # Both OSes because the native verbs still shell out to platform-sensitive
+  # binaries (`tm states` / `tm history` pipe through `column`; `tm history`'s
+  # detail view formats a timestamp with BSD `date -r`, so its detail-mode
+  # scenarios are macOS-gated in the harness).
+  claudemux-core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # Cover the declared minimum (22.7.0 — see decision 0025) plus
+        # the floating Node-22 latest. The minimum slot catches an API
+        # that only landed in a later 22.x; the latest slot catches
+        # forward-looking regressions against the toolchain users will
+        # actually upgrade to.
+        node-version: ['22.7.0', '22']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      # Native `tm states` and `tm history` pipe through the real `column`
+      # binary, and `tm ctx` / `tm history` parse jsonl transcripts as JSON.
+      # On Linux those are installed here; the macOS runner ships both in
+      # its base image.
+      - name: Install jq and column (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y jq bsdextrautils
+
+      # The runtime has no npm dependencies (`ws` is vendored under
+      # `third_party/ws/`); this install only fetches dev tooling (typescript,
+      # vitest, @types/*) so typecheck and the unit suite can run. The
+      # launcher itself never reads `node_modules/`.
+      - name: Install dev dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Versions
+        run: node --version
+
+      - name: Type-check
+        working-directory: plugins/claudemux
+        run: pnpm run typecheck
+
+      - name: Dead-code lint
+        working-directory: plugins/claudemux
+        run: pnpm run lint:dead-code
+
+      # The codex app-server protocol bindings under `src/codex-protocol/`
+      # are emitted by `codex app-server generate-ts --experimental`. They
+      # are vendored as ground truth: a codex upgrade that changes the
+      # wire schema must regenerate this directory in the same change.
+      # The drift gate installs the pinned codex CLI, reruns generate-ts,
+      # and asserts `git diff --exit-code` — a feature commit with a
+      # protocol drift but no regenerated `codex-protocol/` is the bug.
+      #
+      # `@openai/codex` ships as a Node-wrapped binary; `npm install -g`
+      # is enough on both runners. The version is pinned alongside the
+      # vendored output so the gate is deterministic; bumping codex means
+      # bumping this line and regenerating in the same PR.
+      - name: Install codex CLI
+        run: npm install -g '@openai/codex@0.133.0'
+
+      - name: codex-protocol not stale
+        # `--experimental` matches how the directory was generated; without
+        # it the experimental methods (turn/*, thread/*, etc) would drop
+        # out of the output and the diff would always be red.
+        working-directory: plugins/claudemux
+        run: |
+          codex app-server generate-ts --experimental --out src/codex-protocol/
+          git diff --exit-code -- src/codex-protocol/
+
+      - name: Unit tests
+        working-directory: plugins/claudemux
+        run: pnpm test
+
+      # Smoke-test the user-facing launcher itself: it must boot through
+      # Node's type-transform pipeline against the vendored sources without
+      # any `node_modules/ws` present. We hide node_modules during the run
+      # so a regression that quietly resolves `ws` instead of `#ws` is
+      # caught here rather than at install time on a real user's machine.
+      - name: tm launcher boots without runtime deps
+        working-directory: plugins/claudemux
+        run: |
+          mv node_modules .node_modules_hidden
+          if ! ./bin/tm --help >/dev/null; then
+            mv .node_modules_hidden node_modules
+            exit 1
+          fi
+          mv .node_modules_hidden node_modules

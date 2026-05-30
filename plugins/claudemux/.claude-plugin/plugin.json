@@ -1,0 +1,18 @@
+{
+  "name": "claudemux",
+  "version": "1.0.0",
+  "description": "Multi-repo Claude Code orchestrator. Run one dispatcher session in the parent of your repos; spawn, message, and wait on tmux teammates across them — all from one place.",
+  "author": {
+    "name": "YourWildDad"
+  },
+  "keywords": [
+    "claude-code",
+    "tmux",
+    "orchestrator",
+    "multi-repo",
+    "dispatcher"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/excitedjs/claudemux",
+  "repository": "https://github.com/excitedjs/claudemux"
+}
