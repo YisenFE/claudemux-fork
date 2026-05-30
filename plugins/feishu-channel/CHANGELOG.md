@@ -1,5 +1,15 @@
 # feishu-channel changelog
 
+## 0.2.0
+
+### Minor Changes
+
+- 4a4eb64: The received-reaction indicator now picks a random emoji per inbound message from a "seen, on it" pool (👀 `GLANCE` 看, `LGTM` 了解, `Typing` 敲键盘, `GoGoGo` 冲, `OnIt` 在做了) instead of always reacting with 👀. Removal is unchanged — it keys off the reaction_id Feishu returns, so clearing works regardless of which emoji was placed.
+
+### Patch Changes
+
+- 4a4eb64: Relocate the channel's manual live-verification tooling off the shipped `scripts/` surface: delete `verify-legacy-edit.ts` (its `editText` patch→update fallback is already fully covered by the mocked unit suite) and move `dogfood-markdown.ts` to `test/` beside `feishu-live.ts`, documented in the README as a manual card-render QA tool. No runtime behavior change.
+
 ## 0.1.1
 
 ### Patch Changes
