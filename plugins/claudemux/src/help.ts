@@ -180,6 +180,15 @@ export const HELP_TEXTS: Readonly<Record<string, string>> = {
         need it — the Stop hook now covers them via PostCompact /
         SessionEnd.
       --timeout N overrides the 1800s default wait.
+      After sending, confirms the REPL accepted the prompt as a turn
+      (the on-busy marker, or a new user entry in the transcript) and
+      re-sends Enter up to 3x if not — so an Enter swallowed by a modal
+      surfaces a stderr warning instead of a silent wait. The wait then
+      unblocks on either the Stop-hook idle marker OR a settled turn in
+      the transcript jsonl, so a session whose Stop hook never loaded
+      still ends its wait on disk evidence instead of timing out. On
+      that no-hook path the reply is recovered from the transcript (and
+      written back to <sid>.last), so stdout still carries it.
       Empty stdout never silently means success: a turn with no text
       (tool-only, /compact, /clear) prints the sentinel line "(no
       text reply this turn — tool-only, /compact, /clear, or fresh

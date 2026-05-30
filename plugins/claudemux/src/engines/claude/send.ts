@@ -13,9 +13,15 @@
  *     (which fans out by calling `claudeSend` directly).
  */
 
+import { writeFileSync } from 'node:fs'
+
 import { sendKeys } from './keys'
-import { probeStillAlive, waitIdleSignal, waitPaneQuiet } from './wait-signals'
+import { confirmSubmit, probeStillAlive, waitForTurnEnd, waitPaneQuiet } from './wait-signals'
 import { echoCtxToStderr, printLastOrEmpty } from './post-turn'
+import { transcriptFile } from './ctx'
+import { lastAssistantTextAfter, transcriptSizeBytes } from './turn-jsonl'
+import { readIfNonEmpty, resolveSid, rstrip } from './idle'
+import { cwdFile, lastFileFor } from '../../persistence/paths'
 import { die } from './tmux'
 import { isNonNegativeInteger } from './clock'
 import { parseSendArgs } from '../../shared/verb-args'
@@ -46,14 +52,35 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
     return die(`tm send: --timeout must be a non-negative integer (got: '${timeout}')`)
   }
 
+  // Snapshot the transcript offset BEFORE sending so submit-confirmation
+  // and the JSONL wait fallback only read what THIS turn appends — never
+  // a prior turn's settled entry. `null` when the transcript path cannot
+  // be resolved (no recorded cwd/sid); the JSONL-side checks then no-op
+  // and the marker-based behavior stands alone.
+  const sid0 = resolveSid(name)
+  const cwdRaw = readIfNonEmpty(cwdFile(name))
+  const cwd0 = cwdRaw === null ? null : rstrip(cwdRaw)
+  const jsonl = sid0 !== null && cwd0 !== null ? transcriptFile(env.projectsDir, cwd0, sid0) : null
+  const anchor = { jsonl, sinceBytes: jsonl !== null ? transcriptSizeBytes(jsonl) : 0 }
+
   const sentResult = await sendKeys(name, prompt, env.runTmux, process.env)
   if (sentResult.code !== 0) return sentResult
+
+  // Confirm the prompt was accepted as a turn (not swallowed by a modal).
+  // Warn-and-proceed only — never converts a slow-but-live send into a
+  // failure; the wait below still expires to 124 if the turn never runs.
+  // Pane-quiet covers TUI commands with no turn to confirm, so skip it.
+  let confirmStderr = ''
+  if (!paneQuiet) {
+    const confirmed = await confirmSubmit(name, anchor, env.runTmux)
+    if (!confirmed.ok) confirmStderr = confirmed.warn
+  }
 
   const timeoutSec = timeout === null ? 1800 : Number(timeout)
   const verdict = paneQuiet
     ? await waitPaneQuiet(name, timeoutSec, env.runTmux)
-    : await waitIdleSignal(name, timeoutSec, false, env.runTmux)
-  if ('code' in verdict) return verdict
+    : await waitForTurnEnd(name, timeoutSec, false, env.runTmux, anchor)
+  if ('code' in verdict) return { ...verdict, stderr: confirmStderr + verdict.stderr }
   if (!verdict.ok) {
     // Re-probe at the timeout moment: a teammate that died mid-wait must
     // NOT be reported as "still running" with code 124, or the dispatcher's
@@ -62,7 +89,7 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
     // promise 124 ("still running") when the session + sid are still there.
     const dead = await probeStillAlive(name, env.runTmux)
     if (dead !== null) {
-      return { ...dead, stderr: sentResult.stderr + dead.stderr }
+      return { ...dead, stderr: sentResult.stderr + confirmStderr + dead.stderr }
     }
     const kind = paneQuiet ? 'pane-quiet' : 'Stop hook'
     return {
@@ -70,9 +97,29 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
       stdout: printLastOrEmpty(name),
       stderr:
         sentResult.stderr +
+        confirmStderr +
         `tm send: sync wait expired after ${timeoutSec}s on ${name} ` +
         `(no ${kind} fired; the teammate is still running — tail with ` +
         `'tm wait ${name}' or check 'tm status ${name}'). exit ${EXIT_SYNC_WAIT_EXPIRED}.\n`,
+    }
+  }
+
+  // No-hook JSONL fallback: the turn settled in the transcript but the
+  // Stop hook never wrote `<sid>.last` (sendKeys' clearIdle wiped it at
+  // send time and no hook repopulated it). Recover the reply from THIS
+  // turn's appended region — scoped to the send offset, so a prior turn's
+  // text is never surfaced — and persist it exactly as `tm spawn --resume`
+  // seeds `.last`, so stdout AND `tm last` / `tm states` all surface the
+  // reply instead of the "(no text reply...)" sentinel. A textless turn
+  // (tool-only) writes an empty `.last`, clearing any stale value. The
+  // marker path is left untouched: on-stop writes `.last` before touching
+  // the idle marker, so `via: 'marker'` means `.last` is already current.
+  if (!paneQuiet && 'via' in verdict && verdict.via === 'jsonl' && jsonl !== null && sid0 !== null) {
+    const recovered = lastAssistantTextAfter(jsonl, anchor.sinceBytes)
+    try {
+      writeFileSync(lastFileFor(sid0), recovered !== null && recovered.length > 0 ? `${recovered}\n` : '')
+    } catch {
+      // Best-effort: printLastOrEmpty falls back to the sentinel if unwritten.
     }
   }
 
@@ -81,6 +128,6 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
   return {
     code: 0,
     stdout: printLastOrEmpty(name),
-    stderr: sentResult.stderr + trailingStderr,
+    stderr: sentResult.stderr + confirmStderr + trailingStderr,
   }
 }
