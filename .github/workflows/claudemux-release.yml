@@ -149,7 +149,10 @@ jobs:
           # node-version: '22' resolves to the latest Node 22.x release, which
           # is always >= 22.14.0 on current GitHub-hosted runners.
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+          # Pin Node only — deliberately no registry-url. registry-url makes
+          # setup-node write an .npmrc with a `_authToken` entry; this job
+          # configures no npm auth token so that npm authenticates via the
+          # GitHub OIDC token (id-token: write) for trusted publishing instead.
 
       - name: Decide whether this version needs publishing
         id: guard
@@ -182,8 +185,9 @@ jobs:
       - name: Publish @excitedjs/tm to npm (OIDC trusted publishing)
         if: steps.guard.outputs.go == 'true'
         working-directory: plugins/claudemux
-        run: npm publish --provenance --access public
-        # No NODE_AUTH_TOKEN — npm 11.5.1+ automatically detects the GitHub
-        # Actions OIDC environment and exchanges the token with the npm registry.
-        # The package must be configured as a trusted publisher on npmjs.com
-        # (repo=excitedjs/claudemux, workflow=claudemux-release.yml).
+        # Pin the public npm registry explicitly rather than relying on the
+        # implicit default. No npm auth token is set in this job, so npm 11.5.1+
+        # authenticates via the GitHub Actions OIDC environment for trusted
+        # publishing. The package must be configured as a trusted publisher on
+        # npmjs.com (repo=excitedjs/claudemux, workflow=claudemux-release.yml).
+        run: npm publish --provenance --access public --registry=https://registry.npmjs.org
