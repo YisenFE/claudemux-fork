@@ -1,5 +1,10 @@
 /**
- * Shared types for the Feishu channel.
+ * Host access-control state for the Feishu channel.
+ *
+ * These types describe what gets persisted to access.json and what the host
+ * `gate` reasons over — they are policy state, NOT transport I/O, so they live
+ * in the host (claudemux), not the shared core. The core owns only transport-
+ * general types like `Mention`.
  *
  * The access-control state defined here is what gets persisted to access.json
  * and what the pure `gate` function reasons over.
@@ -72,14 +77,4 @@ export interface Access {
   groups: Record<string, GroupEntry>
   /** Pending pairing requests, keyed by pairing code. */
   pending: Record<string, PendingEntry>
-}
-
-/** One @-mention inside an inbound Feishu message. */
-export interface Mention {
-  /** The placeholder token (e.g. `@_user_1`) used in the message text. */
-  key: string
-  /** Resolved identity of the mentioned party. */
-  id?: { open_id?: string; union_id?: string; user_id?: string }
-  /** Display name of the mentioned party. */
-  name?: string
 }
