@@ -1,5 +1,11 @@
 # feishu-channel changelog
 
+## 0.3.3
+
+### Patch Changes
+
+- 886f059: Use Claude Code's injected session id for Feishu proxy identities so multiple teammate sessions no longer collapse to the same channel session id.
+
 ## 0.3.2
 
 ### Patch Changes
