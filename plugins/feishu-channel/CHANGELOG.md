@@ -1,5 +1,11 @@
 # feishu-channel changelog
 
+## 0.3.4
+
+### Patch Changes
+
+- 79bd41f: Handle proper-lockfile stale-reclaim races without crashing the daemon starter.
+
 ## 0.3.3
 
 ### Patch Changes
