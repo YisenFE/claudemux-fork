@@ -1,5 +1,11 @@
 # feishu-channel changelog
 
+## 0.4.1
+
+### Patch Changes
+
+- 158044a: Fix the feishu-channel daemon handoff across plugin reloads by advertising the real plugin version, evicting older daemons, and reconnecting proxies after daemon restarts.
+
 ## 0.4.0
 
 ### Minor Changes
