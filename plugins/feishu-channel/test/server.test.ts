@@ -359,29 +359,52 @@ describe('handleTool — reply', () => {
     expect(JSON.stringify(result.content)).toContain('feishu send failed')
   })
 
-  test('forwards the model-supplied message_id to the transport as a topic anchor', async () => {
-    // Trust-the-model routing: a reply that carries a message_id threads into
-    // that message's topic. No prior inbound delivery is required — Claude may
-    // anchor to any message it can see, not only a still-pending one.
+  test('forwards the message being answered (message_id) to the transport', async () => {
+    // Answering a specific message routes by its message_id; Feishu lands the
+    // reply wherever that message is (its topic, or the main timeline).
     const transport = new FakeTransport()
     const core = makeCore(transport, [])
 
     await core.handleTool('reply', {
       chat_id: 'oc_chat',
-      text: 'in topic',
-      message_id: 'om_anchor',
+      text: 'answering',
+      message_id: 'om_msg',
     })
 
-    expect(transport.sent[0]?.replyToMessageId).toBe('om_anchor')
+    expect(transport.sent[0]?.replyToMessageId).toBe('om_msg')
   })
 
-  test('passes no topic anchor when message_id is omitted', async () => {
+  test('sends by chat_id (no message_id) for an on-your-own-initiative post', async () => {
     const transport = new FakeTransport()
     const core = makeCore(transport, [])
 
-    await core.handleTool('reply', { chat_id: 'oc_chat', text: 'plain' })
+    await core.handleTool('reply', { chat_id: 'oc_chat', text: 'proactive' })
 
     expect(transport.sent[0]?.replyToMessageId).toBeUndefined()
+  })
+
+  test('clears the received indicator for the chat the reply actually landed in', async () => {
+    // A message_id routes the reply by message_id alone, so even a mismatched
+    // chat_id cannot steer it; the indicator is cleared on the chat the reply
+    // landed in (reported by the transport), not the chat_id the caller passed.
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const transport = new FakeTransport()
+    transport.replyLandsInChatId = 'oc_real'
+    const core = makeCore(transport, [])
+
+    // The triggering message arrived in oc_real and is awaiting a reply.
+    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawIm('om_msg', 'oc_real'))
+    // Claude answers it but pairs a mismatched chat_id; routing follows
+    // message_id into oc_real, and the indicator clears there — not on oc_wrong.
+    await core.handleTool('reply', {
+      chat_id: 'oc_wrong',
+      text: 'answering',
+      message_id: 'om_msg',
+    })
+
+    expect(transport.reactionRemovals).toEqual([
+      { messageId: 'om_msg', reactionId: 'rk_om_msg' },
+    ])
   })
 })
 

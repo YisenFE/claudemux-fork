@@ -112,7 +112,7 @@ describe('commentFromBatchQuery', () => {
  */
 function stubClient() {
   const create = vi.fn(async () => ({ data: { message_id: 'om_stub' } }))
-  const reply = vi.fn(async () => ({ data: { message_id: 'om_reply' } }))
+  const reply = vi.fn(async () => ({ data: { message_id: 'om_reply', chat_id: 'oc_reply' } }))
   const patch = vi.fn(async () => ({}))
   const update = vi.fn(async () => ({}))
   const reactionCreate = vi.fn(async () => ({ data: { reaction_id: 'rk_stub' } }))
@@ -206,39 +206,44 @@ describe('createFeishuTransport — sendText', () => {
     expect(result.messageIds[1]).toBe('om_b')
   })
 
-  test('threads the reply via im.message.reply when given a topic anchor', async () => {
+  test('replies via im.message.reply (no thread flag) and reports the landing chat', async () => {
     const stub = stubClient()
     const transport = buildTransport(stub)
 
-    const result = await transport.sendText('oc_chat', 'in topic', {
+    const result = await transport.sendText('oc_chat', 'answering', {
       replyToMessageId: 'om_anchor',
     })
 
     expect(result.messageIds).toEqual(['om_reply'])
+    // The landing chat comes from the reply response, not the chat_id arg —
+    // Feishu routes a reply by message_id into the message's own chat.
+    expect(result.chatId).toBe('oc_reply')
     expect(stub.create).not.toHaveBeenCalled()
     expect(stub.reply).toHaveBeenCalledTimes(1)
     const calls = stub.reply.mock.calls as unknown as Array<
-      [{ path: { message_id: string }; data: { msg_type: string; content: string; reply_in_thread: boolean } }]
+      [{ path: { message_id: string }; data: { msg_type: string; content: string; reply_in_thread?: boolean } }]
     >
     const call = calls[0]?.[0]
     expect(call).toBeDefined()
     if (!call) return
     expect(call.path.message_id).toBe('om_anchor')
-    expect(call.data.reply_in_thread).toBe(true)
     expect(call.data.msg_type).toBe('interactive')
+    // No thread flag — Feishu inherits the replied message's topic on its own.
+    expect(call.data.reply_in_thread).toBeUndefined()
   })
 
-  test('routes by chat_id (create) when no topic anchor is given', async () => {
+  test('routes by chat_id (create) when no message_id is given', async () => {
     const stub = stubClient()
     const transport = buildTransport(stub)
 
-    await transport.sendText('oc_chat', 'plain')
+    const result = await transport.sendText('oc_chat', 'plain')
 
     expect(stub.reply).not.toHaveBeenCalled()
     expect(stub.create).toHaveBeenCalledTimes(1)
+    expect(result.chatId).toBe('oc_chat')
   })
 
-  test('threads every card of a multi-card body to the same anchor', async () => {
+  test('sends every card of a multi-card body as a reply to the same message', async () => {
     const stub = stubClient()
     stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_a' } } as never)
     stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_b' } } as never)

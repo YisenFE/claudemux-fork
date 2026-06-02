@@ -44,26 +44,36 @@ core pipeline and the transport do not change. A delivered event carries a
 `kind` meta attribute (`message` / `doc_comment`) so a multi-event channel
 stays unambiguous to Claude.
 
-### A reply routes by chat_id, with a model-supplied topic anchor
+### A reply has two destinations: the answered message, or a chat
 
-The outbound `reply` tool sends to a `chat_id`. For a message that arrived
-inside a Feishu topic (its `<channel>` tag carries a `thread_id`), `reply` also
-accepts an optional `message_id` anchor: Claude copies it from that same inbound
-tag, and the reply is threaded into that message's topic via
-`im.message.reply(reply_in_thread: true)`. Without the anchor the reply routes by
-`chat_id` as a normal chat message. A chat that does not support thread replies
-(Feishu error `230071`) transparently falls back to the `chat_id` send.
+The outbound `reply` tool takes both `chat_id` and `message_id` as first-class,
+and they are distinct destinations:
 
-Trusting the model-supplied `message_id` for routing is a deliberate maintainer
-decision, not an oversight. The `<channel>` tag delivers `chat_id`,
-`message_id`, and `thread_id` together, and Claude decides "answer in this topic"
-vs "answer the chat" the same way it already decides a p2p reply vs a group one —
-there is no server-side allowlist of which `message_id` it may anchor to. The
-tradeoff is explicit: it keeps the channel stateless and lets Claude thread onto
-any message it can see (not only the one most recently received), in exchange for
-trusting that the `chat_id`/`message_id` it passes are the paired values from one
-inbound tag. `chat_id` stays required and is what `clearReceived` clears, so the
-received indicator is taken off the chat the reply is for.
+- With a `message_id` (the message being answered, copied from its `<channel>`
+  tag), the reply goes through `im.message.reply(message_id)`. Feishu lands it
+  wherever that message lives — back in its topic if it came from one, the main
+  timeline otherwise — with no thread flag and no `thread_id`: replying by
+  `message_id` inherits the original's location automatically. Routing is by
+  `message_id` alone, so the `chat_id` paired with it never steers delivery.
+- With only a `chat_id` (no message to answer), the reply is an
+  `im.message.create` to that chat — a first-class on-your-own-initiative post,
+  not a fallback.
+
+The `<channel>` tag deliberately does NOT expose `thread_id`; the model never
+reasons about topics directly. It only chooses "answer this message" (pass its
+`message_id`) or "post to this chat" (pass the `chat_id`) — the same kind of
+choice it already makes between a p2p and a group reply. Topic placement is
+Feishu's job, derived from the answered message.
+
+Routing by `message_id` alone is what makes a cross-chat misroute structurally
+impossible: no `chat_id` from one conversation can redirect a reply addressed to
+another conversation's `message_id`. The transport reports the chat the reply
+actually landed in (the reply target's chat from the Feishu response), and
+`clearReceived` takes the "received" indicator off that chat — so the indicator
+is always cleared on the chat the reply reached, even if the caller paired a
+stale `chat_id`. A chat that does not support thread replies (Feishu error
+`230071`) transparently falls back to the `chat_id` send; any other non-zero
+Feishu code fails loudly rather than reporting a phantom success.
 
 ### Graceful shutdown is wired from the first commit
 

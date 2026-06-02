@@ -84,6 +84,13 @@ export interface FeishuSendResult {
    * message_ids.
    */
   messageIds: string[]
+  /**
+   * The chat the message actually landed in. When the send replied to a
+   * message_id, this is the reply target's chat from the Feishu response — the
+   * authoritative landing chat, independent of any chat_id the caller paired
+   * with the message_id; otherwise it is the `chat_id` the send was routed to.
+   */
+  chatId: string
 }
 
 /**
@@ -97,7 +104,7 @@ export function textMessageContent(text: string): string {
 }
 
 /** Feishu API error code: "this chat does not support reply in thread". */
-const FEISHU_REPLY_IN_THREAD_UNSUPPORTED = 230071
+const FEISHU_THREAD_REPLY_UNSUPPORTED = 230071
 
 /**
  * The Feishu business error code on an SDK result or a thrown error, or
@@ -124,30 +131,37 @@ function feishuError(res: unknown): Error {
 }
 
 /**
- * Reply to `messageId` with `reply_in_thread`, so the reply lands inside that
- * message's Feishu topic. Returns `{ unsupported: true }` when Feishu reports
- * 230071 (the chat does not support thread replies), letting the caller fall
- * back to a plain `chat_id` send; any other error propagates.
+ * Reply to `messageId` so the reply inherits that message's location: Feishu
+ * lands a reply to a topic message back in the same topic automatically, and a
+ * reply to a main-timeline message in the main timeline — no thread flag is
+ * needed. Returns `{ unsupported: true }` when Feishu reports 230071 (the chat
+ * does not support thread replies), letting the caller fall back to a plain
+ * `chat_id` send; any other non-zero code or thrown error propagates rather
+ * than silently dropping the message.
  */
-async function replyInThreadOnce(
+async function replyToMessageOnce(
   client: lark.Client,
   messageId: string,
   content: string,
-): Promise<{ unsupported: boolean; messageId?: string }> {
+): Promise<{ unsupported: boolean; messageId?: string; chatId?: string }> {
   try {
     const res = await client.im.message.reply({
       path: { message_id: messageId },
-      data: { msg_type: 'interactive', content, reply_in_thread: true },
+      data: { msg_type: 'interactive', content },
     })
     const code = feishuErrorCode(res)
-    if (code === FEISHU_REPLY_IN_THREAD_UNSUPPORTED) return { unsupported: true }
+    if (code === FEISHU_THREAD_REPLY_UNSUPPORTED) return { unsupported: true }
     // Any other non-zero business code is a real failure. Surface it instead of
     // returning a "success" with no message_id, which would report the reply as
     // Sent while Feishu actually delivered nothing.
     if (code) throw feishuError(res)
-    return { unsupported: false, messageId: res.data?.message_id }
+    // chat_id from the reply response is the chat the message ACTUALLY landed
+    // in — the reply target's chat, regardless of any chat_id the caller paired
+    // with the message_id. The caller uses it to clear the right chat's
+    // received indicator.
+    return { unsupported: false, messageId: res.data?.message_id, chatId: res.data?.chat_id }
   } catch (err) {
-    if (feishuErrorCode(err) === FEISHU_REPLY_IN_THREAD_UNSUPPORTED) {
+    if (feishuErrorCode(err) === FEISHU_THREAD_REPLY_UNSUPPORTED) {
       return { unsupported: true }
     }
     throw err
@@ -340,16 +354,16 @@ export interface FeishuTransport {
    */
   start(routes: InboundRoutes): Promise<void>
   /**
-   * Send a text message into a chat. By default routed by `chat_id`, never by
-   * a message_id, so a forged reply target cannot redirect the message into an
-   * unrelated conversation.
-   *
-   * When `opts.replyToMessageId` is set, the message is instead sent as a reply
-   * to that message with `reply_in_thread`, so it lands inside that message's
-   * Feishu topic. The anchor message_id is supplied by the caller from an
-   * inbound message that carried a `thread_id`. If the chat does not support
-   * thread replies (Feishu error 230071), the send falls back to the default
-   * `chat_id` path so the message is still delivered.
+   * Send a text message into a chat. With `opts.replyToMessageId` set, it is
+   * sent as a reply to that message, which makes Feishu place it wherever that
+   * message lives — back in its topic if it was a topic message, or the main
+   * timeline otherwise — with no thread flag. The caller passes the message_id
+   * of the inbound message being answered, so the reply follows the very
+   * message that triggered it. Without `opts.replyToMessageId` the message is
+   * sent by `chat_id` as a standalone message (e.g. a proactive send with no
+   * message to answer). If the chat does not support thread replies (Feishu
+   * error 230071), the reply falls back to the `chat_id` path so it is still
+   * delivered.
    */
   sendText(
     chatId: string,
@@ -644,11 +658,13 @@ export function createFeishuTransport(
       // Render the markdown source into one or more v2 cards. Routing per
       // block type — headings to `header.title`, tables to `tag: table`,
       // everything else to `tag: markdown` (lark_md) — keeps GFM tables and
-      // ATX headings from leaking through as literal `|` and `#`. A body
-      // too large for one card produces several cards, each sent as its own
-      // message_id so the recipient sees a threaded continuation.
+      // ATX headings from leaking through as literal `|` and `#`. A body too
+      // large for one card produces several cards, each its own message_id.
       const cards = renderMarkdownToCards(text)
       const messageIds: string[] = []
+      // The chat the reply actually landed in (the reply target's chat from the
+      // Feishu response); defaults to the routed chat_id for the create path.
+      let landedChatId = chatId
       // Once a chat reports 230071 ("does not support reply in thread") on the
       // first card, every later card falls back to the chat_id path too, so the
       // whole answer lands together rather than splitting across two routes.
@@ -656,9 +672,14 @@ export function createFeishuTransport(
       for (const card of cards) {
         const content = cardToContent(card)
         if (opts?.replyToMessageId && !threadUnsupported) {
-          const reply = await replyInThreadOnce(client, opts.replyToMessageId, content)
+          // Reply to the message: Feishu places it wherever that message lives
+          // (its topic, or the main timeline) — no thread flag, and the chat_id
+          // arg does not steer it. Every card replies to the same message so a
+          // split answer stays together.
+          const reply = await replyToMessageOnce(client, opts.replyToMessageId, content)
           if (!reply.unsupported) {
             if (reply.messageId) messageIds.push(reply.messageId)
+            if (reply.chatId) landedChatId = reply.chatId
             continue
           }
           threadUnsupported = true
@@ -674,7 +695,7 @@ export function createFeishuTransport(
         const id = res.data?.message_id
         if (id) messageIds.push(id)
       }
-      return { messageIds }
+      return { messageIds, chatId: landedChatId }
     },
 
     async addReaction(messageId: string, emoji: string): Promise<string> {

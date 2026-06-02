@@ -150,7 +150,7 @@ export const CHANNEL_TOOLS: Tool[] = [
   {
     name: 'reply',
     description:
-      'Send a message into a Feishu chat. The text is rendered as Markdown by Feishu — use **bold**, *italic*, `inline code`, fenced ``` code blocks, bulleted and numbered lists, and [links](https://example.com) where they help readability. To @-mention a user inline, write <@open_id> (e.g. "<@ou_abc123> 请帮忙看一下"). Pass the chat_id from the <channel> tag of the message you are answering. When that tag also carries a thread_id (the message came from a Feishu topic), pass its message_id too so your reply lands inside that topic.',
+      'Send a message into a Feishu chat. The text is rendered as Markdown by Feishu — use **bold**, *italic*, `inline code`, fenced ``` code blocks, bulleted and numbered lists, and [links](https://example.com) where they help readability. To @-mention a user inline, write <@open_id> (e.g. "<@ou_abc123> 请帮忙看一下"). To answer a specific message, pass its message_id (and the chat_id) from that message\'s <channel> tag; your reply follows that message — into its topic when it came from one, or the main timeline otherwise. To post into a chat on your own initiative, pass just the chat_id.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -166,7 +166,7 @@ export const CHANNEL_TOOLS: Tool[] = [
         message_id: {
           type: 'string',
           description:
-            'Optional topic anchor. When the inbound <channel> tag carries a thread_id (the message came from a Feishu topic), copy that tag\'s message_id here to keep your reply inside that topic. Omit it for an ordinary (non-topic) chat — the reply then goes to the chat as usual.',
+            'Optional. The message you are answering, copied verbatim from its inbound <channel> tag. When set, the reply follows that message — Feishu lands it in the message\'s topic if it came from one, or the main timeline otherwise. Omit it to post into the chat on your own initiative (routed by chat_id).',
         },
       },
       required: ['chat_id', 'text'],
@@ -387,15 +387,15 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
         case 'reply': {
           const chatId = requireString(args, 'chat_id')
           const text = requireString(args, 'text')
-          // Optional topic anchor. When the inbound <channel> tag carried a
-          // thread_id, Claude copies that same tag's message_id here and the
-          // reply is threaded into that message's topic via im.message.reply;
-          // without it the reply routes by chat_id. Routing on the
-          // model-supplied message_id is deliberate: Claude decides "answer in
-          // this topic" vs "answer the chat" the same way it already decides a
-          // p2p reply vs a group one. The chat_id and message_id come paired
-          // from one inbound tag, so clearReceived below still clears the chat
-          // the reply lands in.
+          // Two first-class destinations. With a message_id, the reply follows
+          // that message: Feishu routes it by message_id alone (into the
+          // message's topic, or the main timeline), so the chat_id paired with
+          // it never steers delivery — a mismatched chat_id cannot redirect the
+          // reply into another chat. Without a message_id, the message is sent
+          // to the chat_id (an on-your-own-initiative post). Either way the
+          // transport reports the chat the message actually landed in, which is
+          // what clears the received indicator below — so even a mismatched
+          // chat_id clears the right chat.
           const replyToMessageId =
             typeof args.message_id === 'string' && args.message_id ? args.message_id : undefined
           // The transport renders the markdown source into v2 interactive
@@ -405,16 +405,17 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
           // several messages; their ids come back in `messageIds`, in send
           // order, so the summary names how many landed.
           const result = await deps.transport.sendText(chatId, text, { replyToMessageId })
-          // The chat has been answered — take the "received" indicator back
-          // off every message in it that was waiting for this reply. Reached
-          // only after the send succeeds, so a failed reply leaves the
-          // indicator in place.
-          await clearReceived(chatId)
+          const landedChatId = result.chatId
+          // The chat has been answered — take the "received" indicator back off
+          // every message in it that was waiting for this reply, using the chat
+          // the reply actually landed in. Reached only after the send succeeds,
+          // so a failed reply leaves the indicator in place.
+          await clearReceived(landedChatId)
           const ids = result.messageIds
           const summary =
             ids.length <= 1
-              ? `Sent to ${chatId}${ids[0] ? ` as ${ids[0]}` : ''}.`
-              : `Sent to ${chatId} in ${ids.length} messages.`
+              ? `Sent to ${landedChatId}${ids[0] ? ` as ${ids[0]}` : ''}.`
+              : `Sent to ${landedChatId} in ${ids.length} messages.`
           return toolText(summary)
         }
         case 'react': {
@@ -536,15 +537,14 @@ const CHANNEL_INSTRUCTIONS = [
   '<channel source="feishu"> blocks; the `kind` attribute says which kind of event it is.',
   '',
   'kind="message" — a chat message. Attributes:',
-  '- chat_id: the conversation the message came from; pass it to the `reply` tool to answer.',
-  '- message_id: the specific message; pass it to `react` or `edit_message`.',
+  '- chat_id: the conversation the message came from.',
+  '- message_id: the specific message; pass it to `reply` to answer this message, or to `react` / `edit_message`.',
   '- chat_type: "p2p" for a direct message, "group" for a group chat.',
   '- sender_id: the Feishu open_id of the sender.',
-  '- thread_id: present only when the message came from a Feishu topic (话题). When it is',
-  '  present, keep your answer in that topic by passing this message\'s message_id to `reply`.',
-  'Answer a Feishu user by calling `reply` with the chat_id from the message you are answering.',
-  'If the inbound message carried a thread_id, also pass its message_id to `reply` so the answer',
-  'lands inside that topic; for a message without a thread_id, pass chat_id only.',
+  'To answer a specific message, call `reply` with that message\'s message_id (and its chat_id) from',
+  'the inbound <channel> tag; Feishu lands your reply where that message is — back in its topic when',
+  'it came from one, the main timeline otherwise. To post into a chat on your own initiative, with no',
+  'particular message to answer, call `reply` with just the chat_id.',
   'The `text` you pass to `reply` and `edit_message` is rendered as Markdown by Feishu —',
   'feel free to use **bold**, *italic*, `inline code`, fenced code blocks, lists, and links',
   'when they make a message clearer. To @-mention a user inline, write <@open_id> anywhere',

@@ -14,7 +14,7 @@ function fakeTransport(): FeishuTransport {
     appId: 'cli_fake',
     botOpenId: undefined,
     start: vi.fn(async () => {}),
-    sendText: vi.fn(async () => ({ messageIds: ['om_sent'] })),
+    sendText: vi.fn(async (chatId: string) => ({ messageIds: ['om_sent'], chatId })),
     addReaction: vi.fn(async () => 'rk_1'),
     removeReaction: vi.fn(async () => {}),
     editText: vi.fn(async () => {}),

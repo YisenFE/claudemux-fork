@@ -25,6 +25,12 @@ export class FakeTransport implements FeishuTransport {
   readonly metaFetches: { fileToken: string; fileType: string }[] = []
   /** When set, the named method throws — used to test outbound failure paths. */
   failOn: 'sendText' | 'addReaction' | 'removeReaction' | 'editText' | undefined
+  /**
+   * When set, a `sendText` carrying a `replyToMessageId` reports landing in this
+   * chat — simulating Feishu routing a reply by message_id into the replied
+   * message's own chat, regardless of the `chatId` the caller passed.
+   */
+  replyLandsInChatId: string | undefined
   /** Canned `fetchDocComment` result; `null` simulates a failed enrichment. */
   docComment: FeishuDocComment | null = null
   /** Canned `fetchDocMeta` result; `null` simulates a failed enrichment. */
@@ -50,7 +56,11 @@ export class FakeTransport implements FeishuTransport {
     // messageIds.length the real transport would produce.
     const cards = renderMarkdownToCards(text)
     const messageIds = cards.map((_, i) => `om_sent_${i}`)
-    return { messageIds }
+    // A reply (replyToMessageId set) lands in the replied message's own chat;
+    // mirror that when the test configured it, else report the routed chat.
+    const landedChatId =
+      opts?.replyToMessageId && this.replyLandsInChatId ? this.replyLandsInChatId : chatId
+    return { messageIds, chatId: landedChatId }
   }
 
   /**
