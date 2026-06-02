@@ -294,6 +294,21 @@ describe('createFeishuTransport — sendText', () => {
     ).rejects.toThrow('rate limited')
     expect(stub.create).not.toHaveBeenCalled()
   })
+
+  test('throws on a non-230071 reply result code instead of silently dropping the message', async () => {
+    // The lark SDK returns the raw { code, msg } body for an HTTP-200 business
+    // error, so a non-zero, non-230071 code must be treated as a failure — not
+    // swallowed as a success that reports "Sent" while delivering nothing.
+    const stub = stubClient()
+    stub.reply.mockResolvedValueOnce({ code: 99991400, msg: 'rate limited' } as never)
+    const transport = buildTransport(stub)
+
+    await expect(
+      transport.sendText('oc_chat', 'in topic', { replyToMessageId: 'om_anchor' }),
+    ).rejects.toThrow()
+    // It is a real error, not the 230071 "unsupported" signal, so no fallback.
+    expect(stub.create).not.toHaveBeenCalled()
+  })
 })
 
 describe('createFeishuTransport — inbound startup', () => {

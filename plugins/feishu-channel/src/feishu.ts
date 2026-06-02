@@ -115,6 +115,14 @@ function feishuErrorCode(x: unknown): number | undefined {
   return undefined
 }
 
+/** Build an Error from a non-zero Feishu response, carrying its `code`. */
+function feishuError(res: unknown): Error {
+  const code = feishuErrorCode(res)
+  const msg = (res as { msg?: unknown })?.msg
+  const detail = typeof msg === 'string' && msg ? `: ${msg}` : ''
+  return Object.assign(new Error(`Feishu API error ${code ?? '?'}${detail}`), { code })
+}
+
 /**
  * Reply to `messageId` with `reply_in_thread`, so the reply lands inside that
  * message's Feishu topic. Returns `{ unsupported: true }` when Feishu reports
@@ -131,9 +139,12 @@ async function replyInThreadOnce(
       path: { message_id: messageId },
       data: { msg_type: 'interactive', content, reply_in_thread: true },
     })
-    if (feishuErrorCode(res) === FEISHU_REPLY_IN_THREAD_UNSUPPORTED) {
-      return { unsupported: true }
-    }
+    const code = feishuErrorCode(res)
+    if (code === FEISHU_REPLY_IN_THREAD_UNSUPPORTED) return { unsupported: true }
+    // Any other non-zero business code is a real failure. Surface it instead of
+    // returning a "success" with no message_id, which would report the reply as
+    // Sent while Feishu actually delivered nothing.
+    if (code) throw feishuError(res)
     return { unsupported: false, messageId: res.data?.message_id }
   } catch (err) {
     if (feishuErrorCode(err) === FEISHU_REPLY_IN_THREAD_UNSUPPORTED) {

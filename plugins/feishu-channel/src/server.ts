@@ -387,12 +387,22 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
         case 'reply': {
           const chatId = requireString(args, 'chat_id')
           const text = requireString(args, 'text')
-          // Optional topic anchor: when Claude copies the inbound message_id
-          // (only meaningful for a message that carried a thread_id), the reply
-          // is threaded into that message's topic; otherwise it routes by
-          // chat_id as before.
-          const replyToMessageId =
+          // Optional topic anchor: thread the reply into the inbound message's
+          // topic — but only when that message_id is one this channel actually
+          // delivered for THIS chat. `im.message.reply` routes by message_id, so
+          // honoring an unvetted anchor would let a chat_id paired with another
+          // chat's message_id cross-deliver into that other chat (and clear the
+          // wrong chat's received indicator). `pendingReactions` is the trusted
+          // inbound record (message_id → its chat); an anchor that is unknown or
+          // belongs to a different chat is dropped and the reply routes by
+          // chat_id, so the received indicator is always cleared for the chat
+          // the reply actually lands in.
+          const requestedAnchor =
             typeof args.message_id === 'string' && args.message_id ? args.message_id : undefined
+          const replyToMessageId =
+            requestedAnchor && pendingReactions.get(requestedAnchor)?.chatId === chatId
+              ? requestedAnchor
+              : undefined
           // The transport renders the markdown source into v2 interactive
           // cards (`./render`): headings become the card title, GFM tables
           // become `tag: table` components, every other block becomes a

@@ -53,11 +53,14 @@ from some other context cannot redirect a reply into an unrelated chat.
 For a message that arrived inside a Feishu topic (its `<channel>` tag carries a
 `thread_id`), `reply` accepts an optional `message_id` anchor — copied from that
 same inbound tag — and threads the answer into the topic via
-`im.message.reply(reply_in_thread: true)`. The anchor still only lands the reply
-in the chat that message belongs to; `chat_id` stays required and is what the
-received-indicator is cleared against. A chat that does not support thread
-replies (Feishu error `230071`) transparently falls back to the default
-`chat_id` send.
+`im.message.reply(reply_in_thread: true)`. Because that endpoint routes by
+`message_id`, the anchor is honored only when it matches a message the channel
+actually delivered for the same `chat_id` (the in-memory received record); an
+unknown or cross-chat `message_id` is dropped and the reply routes by `chat_id`,
+so it can never cross-deliver into another chat or clear the wrong chat's
+indicator. `chat_id` stays required and is what the received-indicator is
+cleared against. A chat that does not support thread replies (Feishu error
+`230071`) transparently falls back to the default `chat_id` send.
 
 ### Graceful shutdown is wired from the first commit
 
