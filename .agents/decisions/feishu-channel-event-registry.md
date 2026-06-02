@@ -71,9 +71,12 @@ another conversation's `message_id`. The transport reports the chat the reply
 actually landed in (the reply target's chat from the Feishu response), and
 `clearReceived` takes the "received" indicator off that chat — so the indicator
 is always cleared on the chat the reply reached, even if the caller paired a
-stale `chat_id`. A chat that does not support thread replies (Feishu error
-`230071`) transparently falls back to the `chat_id` send; any other non-zero
-Feishu code fails loudly rather than reporting a phantom success.
+stale `chat_id`. There is deliberately no `chat_id` fallback on the reply path:
+a non-zero Feishu code (on either the reply or the create) fails loudly rather
+than reporting a phantom success, and a reply whose response omits `chat_id`
+fails too, since clearing an indicator on a guessed chat is the very misroute
+this design forbids. A plain reply requests no thread form, so the `230071`
+"group does not support reply in thread" error cannot arise.
 
 ### Graceful shutdown is wired from the first commit
 

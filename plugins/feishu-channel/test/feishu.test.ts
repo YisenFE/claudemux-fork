@@ -245,8 +245,8 @@ describe('createFeishuTransport — sendText', () => {
 
   test('sends every card of a multi-card body as a reply to the same message', async () => {
     const stub = stubClient()
-    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_a' } } as never)
-    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_b' } } as never)
+    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_a', chat_id: 'oc_reply' } } as never)
+    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_b', chat_id: 'oc_reply' } } as never)
     const transport = buildTransport(stub)
 
     const result = await transport.sendText('oc_chat', 'x'.repeat(60_000), {
@@ -262,31 +262,19 @@ describe('createFeishuTransport — sendText', () => {
     expect(result.messageIds[1]).toBe('om_b')
   })
 
-  test('falls back to a chat_id send when the chat reports 230071 (returned code)', async () => {
+  test('throws on a 230071 reply code and never falls back to the caller chat_id', async () => {
+    // A plain reply (no reply_in_thread) cannot trigger 230071 ("group does not
+    // support reply in thread"); should it ever appear, it is treated like any
+    // other non-zero code — thrown, not degraded to an im.message.create on the
+    // caller-supplied chat_id (which could misroute and clear the wrong chat).
     const stub = stubClient()
     stub.reply.mockResolvedValueOnce({ code: 230071, msg: 'not support' } as never)
     const transport = buildTransport(stub)
 
-    const result = await transport.sendText('oc_chat', 'in topic', {
-      replyToMessageId: 'om_anchor',
-    })
-
-    expect(stub.reply).toHaveBeenCalledTimes(1)
-    expect(stub.create).toHaveBeenCalledTimes(1)
-    expect(result.messageIds).toEqual(['om_stub'])
-  })
-
-  test('falls back to a chat_id send when reply throws a 230071 error', async () => {
-    const stub = stubClient()
-    stub.reply.mockRejectedValueOnce(Object.assign(new Error('no thread'), { code: 230071 }))
-    const transport = buildTransport(stub)
-
-    const result = await transport.sendText('oc_chat', 'in topic', {
-      replyToMessageId: 'om_anchor',
-    })
-
-    expect(stub.create).toHaveBeenCalledTimes(1)
-    expect(result.messageIds).toEqual(['om_stub'])
+    await expect(
+      transport.sendText('oc_chat', 'answering', { replyToMessageId: 'om_anchor' }),
+    ).rejects.toThrow()
+    expect(stub.create).not.toHaveBeenCalled()
   })
 
   test('re-throws a non-230071 reply error instead of masking it', async () => {
@@ -300,19 +288,41 @@ describe('createFeishuTransport — sendText', () => {
     expect(stub.create).not.toHaveBeenCalled()
   })
 
-  test('throws on a non-230071 reply result code instead of silently dropping the message', async () => {
+  test('throws on a non-zero reply result code instead of silently dropping the message', async () => {
     // The lark SDK returns the raw { code, msg } body for an HTTP-200 business
-    // error, so a non-zero, non-230071 code must be treated as a failure — not
-    // swallowed as a success that reports "Sent" while delivering nothing.
+    // error, so a non-zero code must be treated as a failure — not swallowed as
+    // a success that reports "Sent" while delivering nothing.
     const stub = stubClient()
     stub.reply.mockResolvedValueOnce({ code: 99991400, msg: 'rate limited' } as never)
     const transport = buildTransport(stub)
 
     await expect(
-      transport.sendText('oc_chat', 'in topic', { replyToMessageId: 'om_anchor' }),
+      transport.sendText('oc_chat', 'answering', { replyToMessageId: 'om_anchor' }),
     ).rejects.toThrow()
-    // It is a real error, not the 230071 "unsupported" signal, so no fallback.
     expect(stub.create).not.toHaveBeenCalled()
+  })
+
+  test('throws on a non-zero create result code instead of silently dropping the message', async () => {
+    // Same guard as the reply path, on the create (chat_id) path: a non-zero
+    // code is a failure, not a phantom Sent.
+    const stub = stubClient()
+    stub.create.mockResolvedValueOnce({ code: 99991400, msg: 'rate limited' } as never)
+    const transport = buildTransport(stub)
+
+    await expect(transport.sendText('oc_chat', 'proactive')).rejects.toThrow()
+  })
+
+  test('throws when a successful reply omits chat_id rather than trusting the caller chat_id', async () => {
+    // The landing chat must come from the reply response. If Feishu omits it we
+    // cannot safely clear a received indicator, and falling back to the caller's
+    // chat_id is exactly the misroute this design forbids — so fail instead.
+    const stub = stubClient()
+    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_reply' } } as never)
+    const transport = buildTransport(stub)
+
+    await expect(
+      transport.sendText('oc_chat', 'answering', { replyToMessageId: 'om_anchor' }),
+    ).rejects.toThrow(/chat_id/)
   })
 })
 
