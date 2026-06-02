@@ -557,6 +557,42 @@ describe('received-reaction indicator', () => {
       { messageId: 'om_msg', reactionId: 'rk_om_msg' },
     ])
   })
+
+  test('a duplicate inbound delivery adds only one received reaction', async () => {
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const transport = new FakeTransport()
+    const core = makeCore(transport, [])
+
+    // Feishu redelivers an event it has not seen acked, so the same message
+    // runs through the pipeline twice. A second reaction would be stranded:
+    // the pending map records only the latest reaction_id, so the first
+    // reaction would never be cleared when Claude replies.
+    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent())
+    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent())
+
+    expect(transport.reactions).toHaveLength(1)
+
+    // The reply clears the one reaction, leaving nothing stranded on Feishu.
+    await core.handleTool('reply', { chat_id: 'oc_chat', text: 'answered' })
+    expect(transport.reactionRemovals).toEqual([
+      { messageId: 'om_msg', reactionId: 'rk_om_msg' },
+    ])
+  })
+
+  test('concurrent duplicate deliveries add only one received reaction', async () => {
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const transport = new FakeTransport()
+    const core = makeCore(transport, [])
+
+    // Two deliveries of the same message race through the pipeline at once,
+    // both reaching markReceived before either has recorded its reaction_id.
+    await Promise.all([
+      core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent()),
+      core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent()),
+    ])
+
+    expect(transport.reactions).toHaveLength(1)
+  })
 })
 
 describe('handleTool — unknown tool', () => {

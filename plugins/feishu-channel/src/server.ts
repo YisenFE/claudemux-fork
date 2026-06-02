@@ -283,6 +283,17 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
    */
   const pendingReactions = new Map<string, { chatId: string; reactionId: string }>()
 
+  /**
+   * message_ids whose received reaction is mid-flight — `addReaction` has been
+   * called but has not yet resolved into {@link pendingReactions}. A duplicate
+   * inbound delivery (Feishu redelivers an event it has not seen acked) reaches
+   * {@link markReceived} again; without this guard a second reaction is added
+   * and the map, keyed by message_id, keeps only the latest reaction_id — the
+   * earlier reaction is then stranded on Feishu and never cleared on reply.
+   * Held only for the duration of the add so a failed add can be retried later.
+   */
+  const reactingMessages = new Set<string>()
+
   async function handleEvent(eventType: string, raw: unknown): Promise<void> {
     const messageId = inboundMessageId(raw)
     const handler = registry.get(eventType)
@@ -336,6 +347,12 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
     const messageId = meta.message_id
     const chatId = meta.chat_id
     if (!messageId || !chatId) return
+    // One received indicator per message: skip a message that already carries a
+    // tracked reaction, or one whose reaction is still being added. This keeps a
+    // duplicate inbound delivery from stranding a second reaction the map would
+    // forget and never clear.
+    if (pendingReactions.has(messageId) || reactingMessages.has(messageId)) return
+    reactingMessages.add(messageId)
     try {
       const reactionId = await deps.transport.addReaction(messageId, pickReceivedReactionEmoji())
       if (!reactionId) {
@@ -348,6 +365,8 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
       pendingReactions.set(messageId, { chatId, reactionId })
     } catch (err) {
       logError(`failed to add the received reaction to message ${messageId}`, err)
+    } finally {
+      reactingMessages.delete(messageId)
     }
   }
 
