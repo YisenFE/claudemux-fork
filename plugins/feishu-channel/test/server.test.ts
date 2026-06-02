@@ -6,6 +6,7 @@ import { saveAccess } from '../src/access-store'
 import { DOC_COMMENT_EVENT_TYPE } from '../src/handlers/doc-comment'
 import { IM_MESSAGE_EVENT_TYPE } from '../src/handlers/im-message'
 import {
+  CLEARED_TOMBSTONE_CAP,
   createChannelCore,
   loadCredentials,
   readEnvFile,
@@ -418,6 +419,37 @@ describe('handleTool — react and edit_message', () => {
   })
 })
 
+/** A resolvable promise, for driving a controlled interleaving in a test. */
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+/**
+ * A transport whose `addReaction` records the reaction immediately (the real
+ * Feishu API adds it on the server before returning) but does not resolve until
+ * `release()` is called — modelling the latency of the remote call so a test
+ * can land a concurrent `reply` while the add is still in flight.
+ */
+class SlowAddTransport extends FakeTransport {
+  private readonly gate = deferred()
+  readonly addStarted = deferred()
+
+  release(): void {
+    this.gate.resolve()
+  }
+
+  override async addReaction(messageId: string, emoji: string): Promise<string> {
+    this.reactions.push({ messageId, emoji })
+    this.addStarted.resolve()
+    await this.gate.promise
+    return `rk_${messageId}`
+  }
+}
+
 describe('received-reaction indicator', () => {
   test('adds the received reaction once an inbound chat message is delivered', async () => {
     writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
@@ -592,6 +624,76 @@ describe('received-reaction indicator', () => {
     ])
 
     expect(transport.reactions).toHaveLength(1)
+  })
+
+  test('a reply during an in-flight addReaction still clears the reaction', async () => {
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const transport = new SlowAddTransport()
+    const core = makeCore(transport, [])
+
+    // The inbound mark begins adding the reaction; addReaction has been called
+    // on Feishu (the reaction now exists there) but has not resolved, so it has
+    // not yet been recorded in the pending map.
+    const delivered = core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent())
+    await transport.addStarted.promise
+
+    // Claude replies before the add resolves — the clear pass runs against a
+    // pending map that does not yet hold this reaction.
+    await core.handleTool('reply', { chat_id: 'oc_chat', text: 'answered' })
+
+    // Let the add finish. The reaction is on Feishu, but the only reply already
+    // ran; without closing this window the reaction is stranded.
+    transport.release()
+    await delivered
+
+    expect(transport.reactions).toHaveLength(1)
+    expect(transport.reactionRemovals).toEqual([
+      { messageId: 'om_msg', reactionId: 'rk_om_msg' },
+    ])
+  })
+
+  test('a redelivery after the reply does not add a second reaction', async () => {
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const transport = new FakeTransport()
+    const core = makeCore(transport, [])
+
+    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent())
+    await core.handleTool('reply', { chat_id: 'oc_chat', text: 'answered' })
+
+    // A late at-least-once redelivery of the same message arrives after the
+    // first reaction was already cleared. Claude has answered and may not reply
+    // again, so a fresh reaction would be stranded; the cleared message is
+    // remembered to suppress it.
+    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent())
+
+    expect(transport.reactions).toHaveLength(1)
+    expect(transport.reactionRemovals).toHaveLength(1)
+  })
+
+  test('the cleared-message tombstone is bounded and evicts the oldest', async () => {
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const transport = new FakeTransport()
+    const core = makeCore(transport, [])
+
+    // React then clear CAP + 1 distinct messages, so that many message_ids get
+    // remembered as cleared. Remembering the (CAP+1)th evicts the very first,
+    // keeping the tombstone — and so process memory — bounded.
+    for (let i = 0; i <= CLEARED_TOMBSTONE_CAP; i++) {
+      await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawIm(`om_${i}`, 'oc_chat'))
+      await core.handleTool('reply', { chat_id: 'oc_chat', text: 'answered' })
+    }
+    const addedDuringFill = transport.reactions.length
+    expect(addedDuringFill).toBe(CLEARED_TOMBSTONE_CAP + 1)
+
+    // The oldest message fell out of the tombstone, so its redelivery reacts
+    // again — the bound is real, at the accepted cost that a redelivery older
+    // than the cap is no longer suppressed.
+    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawIm('om_0', 'oc_chat'))
+    expect(transport.reactions.length).toBe(addedDuringFill + 1)
+
+    // A still-remembered recent message stays suppressed.
+    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawIm(`om_${CLEARED_TOMBSTONE_CAP}`, 'oc_chat'))
+    expect(transport.reactions.length).toBe(addedDuringFill + 1)
   })
 })
 

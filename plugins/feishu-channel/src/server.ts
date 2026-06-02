@@ -94,6 +94,15 @@ export function pickReceivedReactionEmoji(): string {
   return RECEIVED_REACTION_EMOJIS[index] ?? RECEIVED_REACTION_EMOJIS[0]
 }
 
+/**
+ * How many cleared message_ids to remember so a late Feishu redelivery does not
+ * re-add a "received" reaction after the message was already answered. Bounds
+ * the tombstone set: redeliveries arrive within Feishu's retry window, so this
+ * many recent clears comfortably covers them while capping memory in a
+ * long-lived daemon.
+ */
+export const CLEARED_TOMBSTONE_CAP = 1024
+
 /** Pushes one inbound event to the Claude session. */
 export type ChannelNotifier = (
   content: string,
@@ -284,15 +293,39 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
   const pendingReactions = new Map<string, { chatId: string; reactionId: string }>()
 
   /**
-   * message_ids whose received reaction is mid-flight — `addReaction` has been
-   * called but has not yet resolved into {@link pendingReactions}. A duplicate
-   * inbound delivery (Feishu redelivers an event it has not seen acked) reaches
-   * {@link markReceived} again; without this guard a second reaction is added
-   * and the map, keyed by message_id, keeps only the latest reaction_id — the
-   * earlier reaction is then stranded on Feishu and never cleared on reply.
-   * Held only for the duration of the add so a failed add can be retried later.
+   * message_id → the in-flight `addReaction` for its "received" indicator: the
+   * chat it belongs to, and whether a reply for that chat has already landed
+   * while the add was still outstanding. `addReaction` is a remote call and the
+   * `reply` tool runs concurrently on the same core, so a reply can finish
+   * before the add resolves — at which point {@link clearReceived} cannot see a
+   * reaction that is not yet in {@link pendingReactions}. Recording the add here
+   * lets the clear flip `cleared`, so {@link markReceived} removes the reaction
+   * the moment it resolves instead of stranding it. Keyed by message_id so a
+   * duplicate inbound delivery is also deduplicated while an add is mid-flight.
    */
-  const reactingMessages = new Set<string>()
+  const inFlightAdds = new Map<string, { chatId: string; cleared: boolean }>()
+
+  /**
+   * message_ids whose "received" indicator has already been cleared (or
+   * cancelled while still mid-add). A Feishu redelivery of the same message can
+   * arrive after its reply, when nothing is pending or in flight; without this
+   * tombstone {@link markReceived} would add a fresh reaction that the
+   * already-sent reply can no longer clear. Bounded to the most recently
+   * cleared {@link CLEARED_TOMBSTONE_CAP} message_ids — see {@link rememberCleared}.
+   */
+  const clearedMessages = new Set<string>()
+
+  /** Record a message as cleared, evicting the oldest tombstone past the cap. */
+  function rememberCleared(messageId: string): void {
+    // Re-insert to refresh recency (Set keeps insertion order), so the most
+    // recently cleared messages are the last to be evicted.
+    clearedMessages.delete(messageId)
+    clearedMessages.add(messageId)
+    if (clearedMessages.size > CLEARED_TOMBSTONE_CAP) {
+      const oldest = clearedMessages.values().next().value
+      if (oldest !== undefined) clearedMessages.delete(oldest)
+    }
+  }
 
   async function handleEvent(eventType: string, raw: unknown): Promise<void> {
     const messageId = inboundMessageId(raw)
@@ -348,11 +381,19 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
     const chatId = meta.chat_id
     if (!messageId || !chatId) return
     // One received indicator per message: skip a message that already carries a
-    // tracked reaction, or one whose reaction is still being added. This keeps a
-    // duplicate inbound delivery from stranding a second reaction the map would
-    // forget and never clear.
-    if (pendingReactions.has(messageId) || reactingMessages.has(messageId)) return
-    reactingMessages.add(messageId)
+    // tracked reaction, one whose reaction is still being added, or one that was
+    // already cleared by an earlier reply. This keeps a duplicate or late
+    // inbound delivery from stranding a second reaction the map would forget and
+    // never clear.
+    if (
+      pendingReactions.has(messageId) ||
+      inFlightAdds.has(messageId) ||
+      clearedMessages.has(messageId)
+    ) {
+      return
+    }
+    const inFlight = { chatId, cleared: false }
+    inFlightAdds.set(messageId, inFlight)
     try {
       const reactionId = await deps.transport.addReaction(messageId, pickReceivedReactionEmoji())
       if (!reactionId) {
@@ -362,11 +403,22 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
         )
         return
       }
+      if (inFlight.cleared) {
+        // A reply for this chat landed while the add was in flight, so the clear
+        // pass could not see this reaction. Remove it now instead of recording
+        // it as pending — otherwise it would linger until some future reply.
+        try {
+          await deps.transport.removeReaction(messageId, reactionId)
+        } catch (err) {
+          logError(`failed to remove the received reaction from message ${messageId}`, err)
+        }
+        return
+      }
       pendingReactions.set(messageId, { chatId, reactionId })
     } catch (err) {
       logError(`failed to add the received reaction to message ${messageId}`, err)
     } finally {
-      reactingMessages.delete(messageId)
+      inFlightAdds.delete(messageId)
     }
   }
 
@@ -381,9 +433,21 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
    * will not accept is not retried on every later reply.
    */
   async function clearReceived(chatId: string): Promise<void> {
+    // An add still in flight for this chat is not in the pending map yet. Flag
+    // it so markReceived removes its reaction the moment the add resolves, and
+    // tombstone it so a redelivery does not re-add one in the meantime.
+    for (const [messageId, record] of inFlightAdds) {
+      if (record.chatId === chatId) {
+        record.cleared = true
+        rememberCleared(messageId)
+      }
+    }
     const pending = [...pendingReactions].filter(([, record]) => record.chatId === chatId)
     for (const [messageId, record] of pending) {
       pendingReactions.delete(messageId)
+      // Remember the message as cleared so a later redelivery does not add a
+      // fresh reaction this already-sent reply could never take back off.
+      rememberCleared(messageId)
       try {
         await deps.transport.removeReaction(messageId, record.reactionId)
       } catch (err) {
