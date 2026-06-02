@@ -9,6 +9,7 @@ import { existsSync, statSync } from 'node:fs'
 
 import { clearIdle, resolveSidOrDie, resolveSid, isRegularFile } from './idle'
 import { busyMarkerFor, idleMarkerFor, sendAtFile } from '../../persistence/paths'
+import { isSuperseded } from './supersede'
 import { requireSession, resolvePaneTarget } from './tmux'
 import { nowSec, sleepMs } from './clock'
 import { terminalAssistantAfter, userEntryAppearedAfter } from './turn-jsonl'
@@ -128,6 +129,12 @@ export type TurnEndSignal = 'marker' | 'jsonl'
  * (it writes `.last` before touching the idle marker), but on
  * `via: 'jsonl'` no hook ran, so `.last` is absent and the reply must be
  * recovered from the transcript. This function itself stays read-only.
+ *
+ * `sendStamp` is this send's claim from `supersede.ts`. When a newer send
+ * to the same teammate claims a greater stamp mid-wait, this loop returns
+ * `{ superseded: true }` instead of burning the timeout — the caller turns
+ * that into an early exit-0 with a note, since the newer send now owns the
+ * (merged) turn this send was waiting on.
  */
 export async function waitForTurnEnd(
   name: TeammateName,
@@ -135,7 +142,8 @@ export async function waitForTurnEnd(
   fresh: boolean,
   runTmux: TmuxRunner,
   anchor: TurnAnchor,
-): Promise<TmResult | { ok: true; via: TurnEndSignal } | { ok: false }> {
+  sendStamp: number,
+): Promise<TmResult | { ok: true; via: TurnEndSignal } | { ok: false } | { superseded: true }> {
   const sessionMissing = await requireSession(name, runTmux)
   if (sessionMissing !== null) return sessionMissing
   const sidR = resolveSidOrDie(name)
@@ -149,6 +157,7 @@ export async function waitForTurnEnd(
     if (anchor.jsonl !== null && terminalAssistantAfter(anchor.jsonl, anchor.sinceBytes)) {
       return { ok: true, via: 'jsonl' }
     }
+    if (isSuperseded(name, sendStamp)) return { superseded: true }
     await sleepMs(3000)
   }
   return { ok: false }

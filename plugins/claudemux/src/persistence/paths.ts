@@ -60,6 +60,15 @@ export function sendAtFile(name: TeammateName): string {
   return join(TEAMMATE_ROOT, `teammate-${name}.send-at`)
 }
 
+/**
+ * `/tmp/teammate-<name>.send-token` — the latest `tm send`'s claim stamp,
+ * used to auto-supersede an earlier in-flight send when a newer one arrives.
+ * Written and read only by the `tm send` family (no hook mirrors it).
+ */
+export function sendTokenFile(name: TeammateName): string {
+  return join(TEAMMATE_ROOT, `teammate-${name}.send-token`)
+}
+
 /** The session-name prefix every tmux teammate session carries. */
 export const TMUX_SESSION_PREFIX = 'teammate-'
 

@@ -403,6 +403,12 @@ are **always** atomic — one engine operation owns the prompt
 delivery, completion wait, and result extraction. `--no-wait` is
 removed from both verbs across both engines.
 
+Refined later by [send-supersede](/.agents/decisions/send-supersede.md): a
+Claude `send` is still atomic, but when a *newer* `tm send` to the same
+teammate arrives mid-wait, the earlier send returns early (exit 0 + a note)
+and only the latest send waits for the merged reply. That is automatic and
+adds no opt-out flag — `--no-wait` stays removed.
+
 The stdout/stderr split stays the same across engines: stdout is the
 assistant's final text, and status lines (`sent`, `sid` / Codex thread id,
 post-turn `ctx`, raw-inspection path) go to stderr. Codex does not print

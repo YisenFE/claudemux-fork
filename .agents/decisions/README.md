@@ -24,6 +24,7 @@ record kept for history — open it and follow its Status link to the current on
 
 **`tm` verbs, cross-process protocol & teammate lifecycle**
 - [atomic-tm-verbs](/.agents/decisions/atomic-tm-verbs.md) — atomic round-trip verbs with a stdout/stderr split
+- [send-supersede](/.agents/decisions/send-supersede.md) — a later `tm send` auto-supersedes an earlier in-flight send (only the latest waits)
 - [cross-process-cross-platform-invariants](/.agents/decisions/cross-process-cross-platform-invariants.md) — path-builder + cross-platform invariants (promoted into `CLAUDE.md`)
 - [hook-driven-busy-idle-signal](/.agents/decisions/hook-driven-busy-idle-signal.md) — BUSY/idle from hooks, not pane scraping
 - [teammates-launch-without-askuserquestion](/.agents/decisions/teammates-launch-without-askuserquestion.md) — teammates launch with `AskUserQuestion` disabled
@@ -88,6 +89,7 @@ never collide on a sequence number.
 | [node-cli-orchestrator](/.agents/decisions/node-cli-orchestrator.md) | The 1.0 line retires the MCP-native core for a pure Node `tm` CLI | Accepted |
 | [npm-oidc-trusted-publishing](/.agents/decisions/npm-oidc-trusted-publishing.md) | `@excitedjs/tm` publishes to npm via OIDC trusted publishing; three in-repo preconditions (no setup-node `registry-url`, workflow-level `id-token: write`, a `repository` field) each break publishing with a different misleading error | Accepted |
 | [research-hazard-dispositions](/.agents/decisions/research-hazard-dispositions.md) | Every research hazard reaches a recorded disposition before it leaves the research layer | Accepted |
+| [send-supersede](/.agents/decisions/send-supersede.md) | A later `tm send` to a teammate auto-supersedes an earlier in-flight send: the earlier one returns early (exit 0 + note) and only the latest waits for the merged reply | Accepted |
 | [teammates-launch-without-askuserquestion](/.agents/decisions/teammates-launch-without-askuserquestion.md) | Teammates launch with the `AskUserQuestion` tool disabled | Accepted |
 | [tm-quality-hardening](/.agents/decisions/tm-quality-hardening.md) | `tm` was hardened with CI, bats tests, lint, and shared path/encoding helpers | Accepted |
 | [worktree-default-and-name-repo-decoupling](/.agents/decisions/worktree-default-and-name-repo-decoupling.md) | Schema 2 cut: every teammate launches inside a git worktree by default, and the teammate `name` is a flat opaque identifier independent of the repo path | Accepted |

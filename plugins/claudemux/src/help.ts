@@ -100,8 +100,14 @@ lines go to stderr.
 --pane-quiet waits for pane quiet instead of the Stop hook; use for TUI-only
 commands. --timeout defaults to 1800s.
 
-Exit codes: 0 reply printed; 124 wait expired but teammate is still running;
-1 failure. Re-collect 124 with tm wait <name> or inspect with tm status <name>.
+A second tm send to the same teammate while this one is still waiting
+supersedes it: the earlier send returns early (exit 0) with a note on stderr,
+and only the latest send waits for the merged reply. Use this to steer a
+running teammate without waiting for the first send to return.
+
+Exit codes: 0 reply printed (or a supersede note, no reply); 124 wait expired
+but teammate is still running; 1 failure. Re-collect 124 with tm wait <name>
+or inspect with tm status <name>.
 `,
 
   wait: `tm wait <name> [timeout=1800] [--fresh] [--pane-quiet] [--timeout N]

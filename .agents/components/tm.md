@@ -44,6 +44,11 @@ behavior from memory or this doc.
   idle signal, and prints the teammate's reply on **stdout**; status lines
   and the post-turn ctx echo go to **stderr**. This stdout/stderr split is
   deliberate — see [decision atomic-tm-verbs](/.agents/decisions/atomic-tm-verbs.md).
+  A Claude `send` (and `spawn`/`resume --prompt`, which route through it)
+  also **auto-supersedes**: if a newer `tm send` to the same teammate
+  arrives while this one is still waiting, the earlier send returns early
+  (exit 0 + a note) and only the latest send waits for the merged reply —
+  see [decision send-supersede](/.agents/decisions/send-supersede.md).
 - **Read-only / fast verbs** — `ls`, `states`, `last`, `ctx`, `history`,
   `mem`, `doctor`, `kill`, `reload`. Sub-second; safe foreground. `history`
   defaults to bounded JSON and should be paged with `--limit` / `--cursor`

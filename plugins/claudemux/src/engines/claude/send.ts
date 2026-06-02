@@ -16,6 +16,7 @@
 import { writeFileSync } from 'node:fs'
 
 import { sendKeys } from './keys'
+import { claimSendStamp, mintSendStamp } from './supersede'
 import { confirmSubmit, probeStillAlive, waitForTurnEnd, waitPaneQuiet } from './wait-signals'
 import { echoCtxToStderr, printLastOrEmpty } from './post-turn'
 import { transcriptFile } from './ctx'
@@ -52,6 +53,18 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
     return die(`tm send: --timeout must be a non-negative integer (got: '${timeout}')`)
   }
 
+  // Claim this send's place in the teammate's send order BEFORE delivering
+  // it, so a later `tm send` to the same teammate (a second steering prompt)
+  // claims a greater stamp and this send observes itself superseded — and
+  // returns early instead of waiting for a Stop that the merged turn now
+  // settles under the later send. `mint` first (invocation order), then a
+  // max-wins `claim` so a slow write cannot regress a newer send's claim.
+  // Auto-supersede is a property of normal Stop-waiting sends only;
+  // `--pane-quiet` drives hook-less TUI commands, not steering prompts, so
+  // it neither claims nor checks.
+  const sendStamp = paneQuiet ? 0 : mintSendStamp()
+  if (!paneQuiet) claimSendStamp(name, sendStamp)
+
   // Snapshot the transcript offset BEFORE sending so submit-confirmation
   // and the JSONL wait fallback only read what THIS turn appends — never
   // a prior turn's settled entry. `null` when the transcript path cannot
@@ -79,8 +92,25 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
   const timeoutSec = timeout === null ? 1800 : Number(timeout)
   const verdict = paneQuiet
     ? await waitPaneQuiet(name, timeoutSec, env.runTmux)
-    : await waitForTurnEnd(name, timeoutSec, false, env.runTmux, anchor)
+    : await waitForTurnEnd(name, timeoutSec, false, env.runTmux, anchor, sendStamp)
   if ('code' in verdict) return { ...verdict, stderr: confirmStderr + verdict.stderr }
+  if ('superseded' in verdict) {
+    // A newer `tm send` to this teammate arrived before this turn settled.
+    // The merged prompt is now owned by that later send's turn, so return
+    // early (exit 0 — the prompt WAS delivered, this is not a failure) and
+    // tell the agent where the combined reply will land.
+    return {
+      code: 0,
+      stdout: '',
+      stderr:
+        sentResult.stderr +
+        confirmStderr +
+        `tm send: ${name}: superseded by a newer send before this turn settled — ` +
+        `exiting early. This prompt was delivered and is queued into the teammate's ` +
+        `current run; its result merges into the later send's turn, so collect the ` +
+        `combined reply from that send (or 'tm wait ${name}'). exit 0.\n`,
+    }
+  }
   if (!verdict.ok) {
     // Re-probe at the timeout moment: a teammate that died mid-wait must
     // NOT be reported as "still running" with code 124, or the dispatcher's
