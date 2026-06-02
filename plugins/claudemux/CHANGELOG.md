@@ -1,5 +1,11 @@
 # claudemux
 
+## 2.1.2
+
+### Patch Changes
+
+- 2f2f7bf: Refactor `tm history` storage discovery into engine-owned source helpers and remove the unused engine history contract.
+
 ## 2.1.1
 
 ### Patch Changes
