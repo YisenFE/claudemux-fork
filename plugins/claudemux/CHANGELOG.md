@@ -1,5 +1,11 @@
 # claudemux
 
+## 2.0.1
+
+### Patch Changes
+
+- 7b70486: Make Codex history intent previews skip Codex bootstrap AGENTS instructions and use the first real user prompt when no explicit `--intent` is provided.
+
 ## 2.0.0
 
 ### Major Changes
