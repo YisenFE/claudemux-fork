@@ -150,7 +150,7 @@ export const CHANNEL_TOOLS: Tool[] = [
   {
     name: 'reply',
     description:
-      'Send a message into a Feishu chat. The text is rendered as Markdown by Feishu — use **bold**, *italic*, `inline code`, fenced ``` code blocks, bulleted and numbered lists, and [links](https://example.com) where they help readability. To @-mention a user inline, write <@open_id> (e.g. "<@ou_abc123> 请帮忙看一下"). Pass the chat_id from the <channel> tag of the message you are answering.',
+      'Send a message into a Feishu chat. The text is rendered as Markdown by Feishu — use **bold**, *italic*, `inline code`, fenced ``` code blocks, bulleted and numbered lists, and [links](https://example.com) where they help readability. To @-mention a user inline, write <@open_id> (e.g. "<@ou_abc123> 请帮忙看一下"). Pass the chat_id from the <channel> tag of the message you are answering. When that tag also carries a thread_id (the message came from a Feishu topic), pass its message_id too so your reply lands inside that topic.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -162,6 +162,11 @@ export const CHANNEL_TOOLS: Tool[] = [
           type: 'string',
           description:
             'Message body in Markdown. Supports bold, italic, links, ordered and unordered lists, inline code, and fenced code blocks. To @-mention a Feishu user inline, write <@open_id> anywhere in the text (e.g. "<@ou_abc123> 任务完成" or "请 <@ou_abc123> 帮忙 review").',
+        },
+        message_id: {
+          type: 'string',
+          description:
+            'Optional topic anchor. When the inbound <channel> tag carries a thread_id (the message came from a Feishu topic), copy that tag\'s message_id here to keep your reply inside that topic. Omit it for an ordinary (non-topic) chat — the reply then goes to the chat as usual.',
         },
       },
       required: ['chat_id', 'text'],
@@ -382,13 +387,19 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
         case 'reply': {
           const chatId = requireString(args, 'chat_id')
           const text = requireString(args, 'text')
+          // Optional topic anchor: when Claude copies the inbound message_id
+          // (only meaningful for a message that carried a thread_id), the reply
+          // is threaded into that message's topic; otherwise it routes by
+          // chat_id as before.
+          const replyToMessageId =
+            typeof args.message_id === 'string' && args.message_id ? args.message_id : undefined
           // The transport renders the markdown source into v2 interactive
           // cards (`./render`): headings become the card title, GFM tables
           // become `tag: table` components, every other block becomes a
           // `tag: markdown` element. A body too large for one card produces
           // several messages; their ids come back in `messageIds`, in send
           // order, so the summary names how many landed.
-          const result = await deps.transport.sendText(chatId, text)
+          const result = await deps.transport.sendText(chatId, text, { replyToMessageId })
           // The chat has been answered — take the "received" indicator back
           // off every message in it that was waiting for this reply. Reached
           // only after the send succeeds, so a failed reply leaves the
@@ -524,7 +535,11 @@ const CHANNEL_INSTRUCTIONS = [
   '- message_id: the specific message; pass it to `react` or `edit_message`.',
   '- chat_type: "p2p" for a direct message, "group" for a group chat.',
   '- sender_id: the Feishu open_id of the sender.',
+  '- thread_id: present only when the message came from a Feishu topic (话题). When it is',
+  '  present, keep your answer in that topic by passing this message\'s message_id to `reply`.',
   'Answer a Feishu user by calling `reply` with the chat_id from the message you are answering.',
+  'If the inbound message carried a thread_id, also pass its message_id to `reply` so the answer',
+  'lands inside that topic; for a message without a thread_id, pass chat_id only.',
   'The `text` you pass to `reply` and `edit_message` is rendered as Markdown by Feishu —',
   'feel free to use **bold**, *italic*, `inline code`, fenced code blocks, lists, and links',
   'when they make a message clearer. To @-mention a user inline, write <@open_id> anywhere',

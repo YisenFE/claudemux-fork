@@ -96,6 +96,53 @@ export function textMessageContent(text: string): string {
   return JSON.stringify({ text })
 }
 
+/** Feishu API error code: "this chat does not support reply in thread". */
+const FEISHU_REPLY_IN_THREAD_UNSUPPORTED = 230071
+
+/**
+ * The Feishu business error code on an SDK result or a thrown error, or
+ * `undefined`. The lark SDK returns the raw `{ code, msg, data }` body for an
+ * HTTP-200 business error — so a non-zero `code` sits on the resolved value —
+ * and throws for an HTTP-level error, where the code, when present, is on the
+ * thrown axios error's `response.data`. This reads both shapes.
+ */
+function feishuErrorCode(x: unknown): number | undefined {
+  if (!x || typeof x !== 'object') return undefined
+  const top = (x as { code?: unknown }).code
+  if (typeof top === 'number') return top
+  const data = (x as { response?: { data?: { code?: unknown } } }).response?.data
+  if (data && typeof data.code === 'number') return data.code
+  return undefined
+}
+
+/**
+ * Reply to `messageId` with `reply_in_thread`, so the reply lands inside that
+ * message's Feishu topic. Returns `{ unsupported: true }` when Feishu reports
+ * 230071 (the chat does not support thread replies), letting the caller fall
+ * back to a plain `chat_id` send; any other error propagates.
+ */
+async function replyInThreadOnce(
+  client: lark.Client,
+  messageId: string,
+  content: string,
+): Promise<{ unsupported: boolean; messageId?: string }> {
+  try {
+    const res = await client.im.message.reply({
+      path: { message_id: messageId },
+      data: { msg_type: 'interactive', content, reply_in_thread: true },
+    })
+    if (feishuErrorCode(res) === FEISHU_REPLY_IN_THREAD_UNSUPPORTED) {
+      return { unsupported: true }
+    }
+    return { unsupported: false, messageId: res.data?.message_id }
+  } catch (err) {
+    if (feishuErrorCode(err) === FEISHU_REPLY_IN_THREAD_UNSUPPORTED) {
+      return { unsupported: true }
+    }
+    throw err
+  }
+}
+
 /**
  * Feishu's documented hard limit for a card / rich-text request body. Past
  * this the API rejects the call outright; the channel checks against a
@@ -282,11 +329,22 @@ export interface FeishuTransport {
    */
   start(routes: InboundRoutes): Promise<void>
   /**
-   * Send a text message into a chat. Routed by `chat_id`, never by a
-   * message_id, so a forged reply target cannot redirect the message into an
+   * Send a text message into a chat. By default routed by `chat_id`, never by
+   * a message_id, so a forged reply target cannot redirect the message into an
    * unrelated conversation.
+   *
+   * When `opts.replyToMessageId` is set, the message is instead sent as a reply
+   * to that message with `reply_in_thread`, so it lands inside that message's
+   * Feishu topic. The anchor message_id is supplied by the caller from an
+   * inbound message that carried a `thread_id`. If the chat does not support
+   * thread replies (Feishu error 230071), the send falls back to the default
+   * `chat_id` path so the message is still delivered.
    */
-  sendText(chatId: string, text: string): Promise<FeishuSendResult>
+  sendText(
+    chatId: string,
+    text: string,
+    opts?: { replyToMessageId?: string },
+  ): Promise<FeishuSendResult>
   /**
    * Add an emoji reaction to a message and return the reaction_id Feishu
    * assigned. That id is what `removeReaction` needs to take the same reaction
@@ -567,7 +625,11 @@ export function createFeishuTransport(
       ;(standbyTimer as { unref?: () => void }).unref?.()
     },
 
-    async sendText(chatId: string, text: string): Promise<FeishuSendResult> {
+    async sendText(
+      chatId: string,
+      text: string,
+      opts?: { replyToMessageId?: string },
+    ): Promise<FeishuSendResult> {
       // Render the markdown source into one or more v2 cards. Routing per
       // block type — headings to `header.title`, tables to `tag: table`,
       // everything else to `tag: markdown` (lark_md) — keeps GFM tables and
@@ -576,13 +638,26 @@ export function createFeishuTransport(
       // message_id so the recipient sees a threaded continuation.
       const cards = renderMarkdownToCards(text)
       const messageIds: string[] = []
+      // Once a chat reports 230071 ("does not support reply in thread") on the
+      // first card, every later card falls back to the chat_id path too, so the
+      // whole answer lands together rather than splitting across two routes.
+      let threadUnsupported = false
       for (const card of cards) {
+        const content = cardToContent(card)
+        if (opts?.replyToMessageId && !threadUnsupported) {
+          const reply = await replyInThreadOnce(client, opts.replyToMessageId, content)
+          if (!reply.unsupported) {
+            if (reply.messageId) messageIds.push(reply.messageId)
+            continue
+          }
+          threadUnsupported = true
+        }
         const res = await client.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
             receive_id: chatId,
             msg_type: 'interactive',
-            content: cardToContent(card),
+            content,
           },
         })
         const id = res.data?.message_id

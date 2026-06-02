@@ -358,6 +358,28 @@ describe('handleTool — reply', () => {
     expect(result.isError).toBe(true)
     expect(JSON.stringify(result.content)).toContain('feishu send failed')
   })
+
+  test('forwards an optional message_id to the transport as a topic anchor', async () => {
+    const transport = new FakeTransport()
+    const core = makeCore(transport, [])
+
+    await core.handleTool('reply', {
+      chat_id: 'oc_chat',
+      text: 'in topic',
+      message_id: 'om_anchor',
+    })
+
+    expect(transport.sent[0]?.replyToMessageId).toBe('om_anchor')
+  })
+
+  test('passes no topic anchor when message_id is omitted', async () => {
+    const transport = new FakeTransport()
+    const core = makeCore(transport, [])
+
+    await core.handleTool('reply', { chat_id: 'oc_chat', text: 'plain' })
+
+    expect(transport.sent[0]?.replyToMessageId).toBeUndefined()
+  })
 })
 
 describe('handleTool — reply splitting', () => {

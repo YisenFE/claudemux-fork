@@ -47,7 +47,16 @@ describe('normalizeInboundEvent — happy path', () => {
       content: '{"text":"hello there"}',
       mentions: [],
       createTime: '1700000000000',
+      threadId: '',
     })
+  })
+
+  test('captures thread_id for a topic message', () => {
+    expect(normalizeInboundEvent(rawEvent({ thread_id: 'omt_topic' }))?.threadId).toBe('omt_topic')
+  })
+
+  test('a missing thread_id becomes an empty string', () => {
+    expect(normalizeInboundEvent(rawEvent())?.threadId).toBe('')
   })
 
   test('captures sender_type=bot for a bot sender', () => {
@@ -227,6 +236,18 @@ describe('createImMessageHandler — delivery', () => {
 
     expect(delivery?.meta.chat_type).toBe('group')
     expect(delivery?.meta.kind).toBe('message')
+  })
+
+  test('tags a topic message with thread_id so the model can reply in-topic', async () => {
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const handler = createImMessageHandler()
+
+    const delivery = await handler.handle(
+      rawEvent({ thread_id: 'omt_topic' }),
+      makeCtx(new FakeTransport()),
+    )
+
+    expect(delivery?.meta.thread_id).toBe('omt_topic')
   })
 })
 

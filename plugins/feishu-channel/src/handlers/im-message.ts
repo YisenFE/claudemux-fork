@@ -42,6 +42,12 @@ export interface FeishuInboundEvent {
   mentions: Mention[]
   /** Feishu create_time (epoch millis as a string), or `''` if absent. */
   createTime: string
+  /**
+   * thread_id (`omt_...`) of the topic this message belongs to, or `''` when
+   * the message is not a topic message. Feishu returns it only for messages
+   * inside a topic, so its emptiness is the "not a topic" signal.
+   */
+  threadId: string
 }
 
 /**
@@ -303,13 +309,19 @@ async function handleIntroduce(event: FeishuInboundEvent, ctx: HandlerContext): 
 /** Build the `<channel>` tag attributes for a delivered message. */
 function buildMeta(event: FeishuInboundEvent): Record<string, string> {
   // Keys must be alphanumeric-plus-underscore — a hyphen would be dropped.
-  return {
+  const meta: Record<string, string> = {
     kind: 'message',
     chat_id: event.chatId,
     message_id: event.messageId,
     chat_type: event.chatType,
     sender_id: event.senderId,
   }
+  // Only topic messages carry a thread_id; omit the attribute entirely for an
+  // ordinary message so a non-topic `<channel>` tag stays free of an empty
+  // thread_id. When present, it tells the model the message came from a topic
+  // and which message_id to pass to `reply` to answer inside that topic.
+  if (event.threadId) meta.thread_id = event.threadId
+  return meta
 }
 
 /** The message sent back to an un-paired sender, carrying their pairing code. */
@@ -369,6 +381,7 @@ export function normalizeInboundEvent(raw: unknown): FeishuInboundEvent | null {
     content: asString(message.content),
     mentions: normalizeMentions(message.mentions),
     createTime: asString(message.create_time),
+    threadId: asString(message.thread_id),
   }
 }
 

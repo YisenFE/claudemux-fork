@@ -195,7 +195,9 @@ describe('startDaemon (process body)', () => {
     })
     proxies.push(proxy)
     const result = await proxy.client.callTool('reply', { chat_id: 'oc_1', text: 'hi' })
-    expect(transport.sendText).toHaveBeenCalledWith('oc_1', 'hi')
+    // No topic anchor on a plain reply — the transport is called with an
+    // undefined replyToMessageId and routes by chat_id as before.
+    expect(transport.sendText).toHaveBeenCalledWith('oc_1', 'hi', { replyToMessageId: undefined })
     expect(result).toBeDefined()
   })
 

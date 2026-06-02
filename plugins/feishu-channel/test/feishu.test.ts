@@ -112,13 +112,14 @@ describe('commentFromBatchQuery', () => {
  */
 function stubClient() {
   const create = vi.fn(async () => ({ data: { message_id: 'om_stub' } }))
+  const reply = vi.fn(async () => ({ data: { message_id: 'om_reply' } }))
   const patch = vi.fn(async () => ({}))
   const update = vi.fn(async () => ({}))
   const reactionCreate = vi.fn(async () => ({ data: { reaction_id: 'rk_stub' } }))
   const reactionDelete = vi.fn(async () => ({}))
   const stub = {
     im: {
-      message: { create, patch, update },
+      message: { create, reply, patch, update },
       messageReaction: { create: reactionCreate, delete: reactionDelete },
     },
     drive: {
@@ -130,6 +131,7 @@ function stubClient() {
   return {
     client: stub as unknown as lark.Client,
     create,
+    reply,
     patch,
     update,
     reactionCreate,
@@ -202,6 +204,95 @@ describe('createFeishuTransport — sendText', () => {
     expect(stub.create.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(result.messageIds[0]).toBe('om_a')
     expect(result.messageIds[1]).toBe('om_b')
+  })
+
+  test('threads the reply via im.message.reply when given a topic anchor', async () => {
+    const stub = stubClient()
+    const transport = buildTransport(stub)
+
+    const result = await transport.sendText('oc_chat', 'in topic', {
+      replyToMessageId: 'om_anchor',
+    })
+
+    expect(result.messageIds).toEqual(['om_reply'])
+    expect(stub.create).not.toHaveBeenCalled()
+    expect(stub.reply).toHaveBeenCalledTimes(1)
+    const calls = stub.reply.mock.calls as unknown as Array<
+      [{ path: { message_id: string }; data: { msg_type: string; content: string; reply_in_thread: boolean } }]
+    >
+    const call = calls[0]?.[0]
+    expect(call).toBeDefined()
+    if (!call) return
+    expect(call.path.message_id).toBe('om_anchor')
+    expect(call.data.reply_in_thread).toBe(true)
+    expect(call.data.msg_type).toBe('interactive')
+  })
+
+  test('routes by chat_id (create) when no topic anchor is given', async () => {
+    const stub = stubClient()
+    const transport = buildTransport(stub)
+
+    await transport.sendText('oc_chat', 'plain')
+
+    expect(stub.reply).not.toHaveBeenCalled()
+    expect(stub.create).toHaveBeenCalledTimes(1)
+  })
+
+  test('threads every card of a multi-card body to the same anchor', async () => {
+    const stub = stubClient()
+    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_a' } } as never)
+    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_b' } } as never)
+    const transport = buildTransport(stub)
+
+    const result = await transport.sendText('oc_chat', 'x'.repeat(60_000), {
+      replyToMessageId: 'om_anchor',
+    })
+
+    expect(stub.reply.mock.calls.length).toBeGreaterThanOrEqual(2)
+    const anchors = (
+      stub.reply.mock.calls as unknown as Array<[{ path: { message_id: string } }]>
+    ).map((c) => c[0].path.message_id)
+    expect(anchors.every((id) => id === 'om_anchor')).toBe(true)
+    expect(result.messageIds[0]).toBe('om_a')
+    expect(result.messageIds[1]).toBe('om_b')
+  })
+
+  test('falls back to a chat_id send when the chat reports 230071 (returned code)', async () => {
+    const stub = stubClient()
+    stub.reply.mockResolvedValueOnce({ code: 230071, msg: 'not support' } as never)
+    const transport = buildTransport(stub)
+
+    const result = await transport.sendText('oc_chat', 'in topic', {
+      replyToMessageId: 'om_anchor',
+    })
+
+    expect(stub.reply).toHaveBeenCalledTimes(1)
+    expect(stub.create).toHaveBeenCalledTimes(1)
+    expect(result.messageIds).toEqual(['om_stub'])
+  })
+
+  test('falls back to a chat_id send when reply throws a 230071 error', async () => {
+    const stub = stubClient()
+    stub.reply.mockRejectedValueOnce(Object.assign(new Error('no thread'), { code: 230071 }))
+    const transport = buildTransport(stub)
+
+    const result = await transport.sendText('oc_chat', 'in topic', {
+      replyToMessageId: 'om_anchor',
+    })
+
+    expect(stub.create).toHaveBeenCalledTimes(1)
+    expect(result.messageIds).toEqual(['om_stub'])
+  })
+
+  test('re-throws a non-230071 reply error instead of masking it', async () => {
+    const stub = stubClient()
+    stub.reply.mockRejectedValueOnce(Object.assign(new Error('rate limited'), { code: 99991400 }))
+    const transport = buildTransport(stub)
+
+    await expect(
+      transport.sendText('oc_chat', 'in topic', { replyToMessageId: 'om_anchor' }),
+    ).rejects.toThrow('rate limited')
+    expect(stub.create).not.toHaveBeenCalled()
   })
 })
 

@@ -15,7 +15,7 @@ import { renderMarkdownToCards } from '@excitedjs/feishu-transport'
 export class FakeTransport implements FeishuTransport {
   readonly appId: string
   botOpenId: string | undefined
-  readonly sent: { chatId: string; text: string }[] = []
+  readonly sent: { chatId: string; text: string; replyToMessageId?: string }[] = []
   readonly reactions: { messageId: string; emoji: string }[] = []
   readonly reactionRemovals: { messageId: string; reactionId: string }[] = []
   readonly edits: { messageId: string; text: string }[] = []
@@ -37,9 +37,13 @@ export class FakeTransport implements FeishuTransport {
 
   async start(): Promise<void> {}
 
-  async sendText(chatId: string, text: string): Promise<FeishuSendResult> {
+  async sendText(
+    chatId: string,
+    text: string,
+    opts?: { replyToMessageId?: string },
+  ): Promise<FeishuSendResult> {
     if (this.failOn === 'sendText') throw new Error('feishu send failed')
-    this.sent.push({ chatId, text })
+    this.sent.push({ chatId, text, replyToMessageId: opts?.replyToMessageId })
     // The real transport renders the markdown into one or more cards and
     // returns one message_id per card sent. Mirror that here so a test that
     // exercises the "split across messages" summary path sees the same

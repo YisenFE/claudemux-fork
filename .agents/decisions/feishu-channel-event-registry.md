@@ -44,11 +44,20 @@ core pipeline and the transport do not change. A delivered event carries a
 `kind` meta attribute (`message` / `doc_comment`) so a multi-event channel
 stays unambiguous to Claude.
 
-### A reply is routed by chat_id, never by message_id
+### A reply is routed by chat_id, with an optional topic anchor
 
-The outbound `reply` tool sends to a `chat_id`. It never derives the
-destination from a `message_id`. A `message_id` Claude echoes back from some
-other context therefore cannot redirect a reply into an unrelated chat.
+The outbound `reply` tool sends to a `chat_id` by default; it never derives the
+destination from an arbitrary `message_id`, so a `message_id` Claude echoes back
+from some other context cannot redirect a reply into an unrelated chat.
+
+For a message that arrived inside a Feishu topic (its `<channel>` tag carries a
+`thread_id`), `reply` accepts an optional `message_id` anchor — copied from that
+same inbound tag — and threads the answer into the topic via
+`im.message.reply(reply_in_thread: true)`. The anchor still only lands the reply
+in the chat that message belongs to; `chat_id` stays required and is what the
+received-indicator is cleared against. A chat that does not support thread
+replies (Feishu error `230071`) transparently falls back to the default
+`chat_id` send.
 
 ### Graceful shutdown is wired from the first commit
 
