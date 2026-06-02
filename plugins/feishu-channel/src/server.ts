@@ -387,22 +387,17 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
         case 'reply': {
           const chatId = requireString(args, 'chat_id')
           const text = requireString(args, 'text')
-          // Optional topic anchor: thread the reply into the inbound message's
-          // topic — but only when that message_id is one this channel actually
-          // delivered for THIS chat. `im.message.reply` routes by message_id, so
-          // honoring an unvetted anchor would let a chat_id paired with another
-          // chat's message_id cross-deliver into that other chat (and clear the
-          // wrong chat's received indicator). `pendingReactions` is the trusted
-          // inbound record (message_id → its chat); an anchor that is unknown or
-          // belongs to a different chat is dropped and the reply routes by
-          // chat_id, so the received indicator is always cleared for the chat
-          // the reply actually lands in.
-          const requestedAnchor =
-            typeof args.message_id === 'string' && args.message_id ? args.message_id : undefined
+          // Optional topic anchor. When the inbound <channel> tag carried a
+          // thread_id, Claude copies that same tag's message_id here and the
+          // reply is threaded into that message's topic via im.message.reply;
+          // without it the reply routes by chat_id. Routing on the
+          // model-supplied message_id is deliberate: Claude decides "answer in
+          // this topic" vs "answer the chat" the same way it already decides a
+          // p2p reply vs a group one. The chat_id and message_id come paired
+          // from one inbound tag, so clearReceived below still clears the chat
+          // the reply lands in.
           const replyToMessageId =
-            requestedAnchor && pendingReactions.get(requestedAnchor)?.chatId === chatId
-              ? requestedAnchor
-              : undefined
+            typeof args.message_id === 'string' && args.message_id ? args.message_id : undefined
           // The transport renders the markdown source into v2 interactive
           // cards (`./render`): headings become the card title, GFM tables
           // become `tag: table` components, every other block becomes a

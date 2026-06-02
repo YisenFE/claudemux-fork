@@ -44,23 +44,26 @@ core pipeline and the transport do not change. A delivered event carries a
 `kind` meta attribute (`message` / `doc_comment`) so a multi-event channel
 stays unambiguous to Claude.
 
-### A reply is routed by chat_id, with an optional topic anchor
+### A reply routes by chat_id, with a model-supplied topic anchor
 
-The outbound `reply` tool sends to a `chat_id` by default; it never derives the
-destination from an arbitrary `message_id`, so a `message_id` Claude echoes back
-from some other context cannot redirect a reply into an unrelated chat.
+The outbound `reply` tool sends to a `chat_id`. For a message that arrived
+inside a Feishu topic (its `<channel>` tag carries a `thread_id`), `reply` also
+accepts an optional `message_id` anchor: Claude copies it from that same inbound
+tag, and the reply is threaded into that message's topic via
+`im.message.reply(reply_in_thread: true)`. Without the anchor the reply routes by
+`chat_id` as a normal chat message. A chat that does not support thread replies
+(Feishu error `230071`) transparently falls back to the `chat_id` send.
 
-For a message that arrived inside a Feishu topic (its `<channel>` tag carries a
-`thread_id`), `reply` accepts an optional `message_id` anchor — copied from that
-same inbound tag — and threads the answer into the topic via
-`im.message.reply(reply_in_thread: true)`. Because that endpoint routes by
-`message_id`, the anchor is honored only when it matches a message the channel
-actually delivered for the same `chat_id` (the in-memory received record); an
-unknown or cross-chat `message_id` is dropped and the reply routes by `chat_id`,
-so it can never cross-deliver into another chat or clear the wrong chat's
-indicator. `chat_id` stays required and is what the received-indicator is
-cleared against. A chat that does not support thread replies (Feishu error
-`230071`) transparently falls back to the default `chat_id` send.
+Trusting the model-supplied `message_id` for routing is a deliberate maintainer
+decision, not an oversight. The `<channel>` tag delivers `chat_id`,
+`message_id`, and `thread_id` together, and Claude decides "answer in this topic"
+vs "answer the chat" the same way it already decides a p2p reply vs a group one —
+there is no server-side allowlist of which `message_id` it may anchor to. The
+tradeoff is explicit: it keeps the channel stateless and lets Claude thread onto
+any message it can see (not only the one most recently received), in exchange for
+trusting that the `chat_id`/`message_id` it passes are the paired values from one
+inbound tag. `chat_id` stays required and is what `clearReceived` clears, so the
+received indicator is taken off the chat the reply is for.
 
 ### Graceful shutdown is wired from the first commit
 

@@ -359,39 +359,20 @@ describe('handleTool — reply', () => {
     expect(JSON.stringify(result.content)).toContain('feishu send failed')
   })
 
-  test('threads the reply when the anchor message_id was delivered for this chat', async () => {
-    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+  test('forwards the model-supplied message_id to the transport as a topic anchor', async () => {
+    // Trust-the-model routing: a reply that carries a message_id threads into
+    // that message's topic. No prior inbound delivery is required — Claude may
+    // anchor to any message it can see, not only a still-pending one.
     const transport = new FakeTransport()
     const core = makeCore(transport, [])
 
-    // Deliver an inbound message so the core trusts om_msg ∈ oc_chat.
-    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawIm('om_msg', 'oc_chat'))
-    await core.handleTool('reply', { chat_id: 'oc_chat', text: 'in topic', message_id: 'om_msg' })
+    await core.handleTool('reply', {
+      chat_id: 'oc_chat',
+      text: 'in topic',
+      message_id: 'om_anchor',
+    })
 
-    expect(transport.sent[0]?.replyToMessageId).toBe('om_msg')
-  })
-
-  test('drops a topic anchor whose message_id belongs to a different chat', async () => {
-    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
-    const transport = new FakeTransport()
-    const core = makeCore(transport, [])
-
-    // om_a was delivered for oc_a. Answering oc_b must not thread onto it:
-    // im.message.reply routes by message_id, so honoring a foreign anchor would
-    // cross-deliver into oc_a and clear oc_b's indicator against the wrong chat.
-    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawIm('om_a', 'oc_a'))
-    await core.handleTool('reply', { chat_id: 'oc_b', text: 'wrong chat', message_id: 'om_a' })
-
-    expect(transport.sent[0]?.replyToMessageId).toBeUndefined()
-  })
-
-  test('drops a topic anchor whose message_id was never delivered', async () => {
-    const transport = new FakeTransport()
-    const core = makeCore(transport, [])
-
-    await core.handleTool('reply', { chat_id: 'oc_chat', text: 'forged', message_id: 'om_unknown' })
-
-    expect(transport.sent[0]?.replyToMessageId).toBeUndefined()
+    expect(transport.sent[0]?.replyToMessageId).toBe('om_anchor')
   })
 
   test('passes no topic anchor when message_id is omitted', async () => {
