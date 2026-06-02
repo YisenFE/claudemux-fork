@@ -1,5 +1,11 @@
 # claudemux
 
+## 2.1.1
+
+### Patch Changes
+
+- 28a0352: Publish the npm CLI as compiled JavaScript so `npx @excitedjs/tm` runs from `node_modules` on Node 22.x without relying on runtime TypeScript type stripping.
+
 ## 2.1.0
 
 ### Minor Changes
