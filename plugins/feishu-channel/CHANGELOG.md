@@ -1,5 +1,11 @@
 # feishu-channel changelog
 
+## 0.4.2
+
+### Patch Changes
+
+- cb375c2: Harden Feishu channel bot discovery names and bound running WebSocket reconnect retries.
+
 ## 0.4.1
 
 ### Patch Changes
