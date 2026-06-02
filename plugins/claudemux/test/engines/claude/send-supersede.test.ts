@@ -4,19 +4,24 @@
  * earlier send returns early (exit 0) with a note instead of burning its
  * full timeout to a 124.
  *
- * The "merged result" the dispatcher eventually reads is emergent from
- * Claude Code's own queue behavior (queued prompts fold into the ongoing
- * turn and the model answers them together at the final Stop). `tm` does
- * not merge anything — it only (a) lets every superseded send return early
- * with a note, and (b) lets the single surviving (latest, never-superseded)
- * send keep waiting for that final Stop. These tests pin both halves plus
- * the cross-process token protocol that decides who is superseded.
+ * Two properties make this safe under concurrency (these tests pin both):
  *
- * Coordination across concurrent `tm send` processes is file-only (same
- * discipline as the idle/busy markers): each send claims a millisecond
- * stamp in `/tmp/teammate-<name>.send-token` (max-wins, so an older send
- * cannot regress the file), and an in-flight send is superseded the moment
- * the file holds a stamp newer than its own.
+ *  - **Exactly one survivor.** Each send claims a unique single-use token in
+ *    `/tmp/teammate-<name>.send-token` with an atomic temp-write + rename,
+ *    and supersede is decided by token *identity* (the file no longer holds
+ *    my token), never by comparing millisecond magnitudes. So two sends in
+ *    the same millisecond cannot tie, and a late/replayed claim cannot
+ *    "regress" the file into a state where two sends both think they
+ *    survived (which would resurrect the original 124/marker race).
+ *
+ *  - **Claim only after delivery.** A send claims the token only after its
+ *    `sendKeys` actually lands the prompt. A send that fails to deliver must
+ *    not retire an earlier waiting send with a false "your result merges
+ *    into mine" promise.
+ *
+ * The "merged result" the dispatcher eventually reads is emergent from
+ * Claude Code's own queue behavior; `tm` only lets superseded sends return
+ * early and lets the single survivor keep waiting for the final Stop.
  */
 
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -25,10 +30,12 @@ import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 
 import { claudeSend } from '../../../src/engines/claude/send'
+import { waitForTurnEnd } from '../../../src/engines/claude/wait-signals'
 import {
-  claimSendStamp,
+  claimSendToken,
   isSuperseded,
-  readSendStamp,
+  mintSendToken,
+  readSendToken,
 } from '../../../src/engines/claude/supersede'
 import {
   idleDir,
@@ -51,9 +58,40 @@ function fakeTmuxAlive(claudeName: string): TmuxRunner {
   }
 }
 
-function fakeEnv(claudeName: string): ClaudeVerbEnv {
+/**
+ * A tmux runner that, on every `has-session` probe, writes `laterToken` into
+ * the teammate's send-token file — simulating a *newer* `tm send` that
+ * claimed the teammate. `waitForTurnEnd` calls `requireSession` (→
+ * `has-session`) at entry, AFTER the send under test has already claimed its
+ * own token, so the loop's first supersede check sees the later token.
+ */
+function fakeTmuxInjectingLater(claudeName: string, laterToken: string): TmuxRunner {
+  const sessionName = `teammate-${claudeName}`
+  return async (args) => {
+    const verb = args[0]
+    if (verb === 'has-session') {
+      writeFileSync(sendTokenFile(claudeName), `${laterToken}\n`)
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    if (verb === 'list-sessions') return { code: 0, stdout: `$0 ${sessionName}\n`, stderr: '' }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+}
+
+/** A tmux runner whose session is alive but every `send-keys` fails — delivery never lands. */
+function fakeTmuxFailDelivery(claudeName: string): TmuxRunner {
+  const sessionName = `teammate-${claudeName}`
+  return async (args) => {
+    const verb = args[0]
+    if (verb === 'list-sessions') return { code: 0, stdout: `$0 ${sessionName}\n`, stderr: '' }
+    if (verb === 'send-keys') return { code: 1, stdout: '', stderr: 'send-keys: no server' }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+}
+
+function envWith(runTmux: TmuxRunner): ClaudeVerbEnv {
   return {
-    runTmux: fakeTmuxAlive(claudeName),
+    runTmux,
     runColumn: async () => ({ code: 0, stdout: '', stderr: '' }),
     dispatcherDir: tmpdir(),
     projectsDir: tmpdir(),
@@ -80,18 +118,11 @@ function seedTeammateSid(name: string): string {
   return sid
 }
 
-/** Drop a raw stamp into the token file (simulates another send having claimed it). */
-function seedSendToken(name: string, stamp: number): void {
-  writeFileSync(sendTokenFile(name), `${stamp}\n`)
-}
-
 let savedConfirmMs: string | undefined
 
 beforeEach(() => {
   createdNames.length = 0
   createdSids.length = 0
-  // Disable submit-confirmation so these synthetic scenarios are not held
-  // up by its budget — supersede is a wait-loop property, not a submit one.
   savedConfirmMs = process.env['CLAUDEMUX_CONFIRM_SUBMIT_MS']
   process.env['CLAUDEMUX_CONFIRM_SUBMIT_MS'] = '0'
 })
@@ -109,72 +140,135 @@ afterEach(() => {
   }
 })
 
-describe('isSuperseded predicate', () => {
-  test('no token file → never superseded', () => {
-    const name = uniqueName('pred-absent')
-    expect(isSuperseded(name, 1000)).toBe(false)
-  })
-
-  test('file stamp equals mine → not superseded (I am the one who claimed it)', () => {
-    const name = uniqueName('pred-equal')
-    seedSendToken(name, 1000)
-    expect(isSuperseded(name, 1000)).toBe(false)
-  })
-
-  test('file stamp older than mine → not superseded (I am newer)', () => {
-    const name = uniqueName('pred-older')
-    seedSendToken(name, 1000)
-    expect(isSuperseded(name, 1001)).toBe(false)
-  })
-
-  test('file stamp newer than mine → superseded (a later send claimed it)', () => {
-    const name = uniqueName('pred-newer')
-    seedSendToken(name, 1001)
-    expect(isSuperseded(name, 1000)).toBe(true)
+describe('mintSendToken', () => {
+  test('produces a unique token on every call (no same-millisecond collision)', () => {
+    const tokens = new Set([
+      mintSendToken(),
+      mintSendToken(),
+      mintSendToken(),
+      mintSendToken(),
+    ])
+    expect(tokens.size).toBe(4)
   })
 })
 
-describe('claimSendStamp is max-wins', () => {
-  test('claims when the file is absent', () => {
-    const name = uniqueName('claim-absent')
-    claimSendStamp(name, 500)
-    expect(readSendStamp(name)).toBe(500)
+describe('isSuperseded is identity-based', () => {
+  test('no token file → never superseded', () => {
+    const name = uniqueName('id-absent')
+    expect(isSuperseded(name, 'tok')).toBe(false)
   })
 
-  test('a newer stamp overwrites an older one', () => {
-    const name = uniqueName('claim-newer')
-    claimSendStamp(name, 500)
-    claimSendStamp(name, 1000)
-    expect(readSendStamp(name)).toBe(1000)
+  test('file holds my token → not superseded', () => {
+    const name = uniqueName('id-mine')
+    claimSendToken(name, 'tok-mine')
+    expect(isSuperseded(name, 'tok-mine')).toBe(false)
+    expect(readSendToken(name)).toBe('tok-mine')
   })
 
-  test('an older stamp does NOT regress the file', () => {
-    const name = uniqueName('claim-regress')
-    claimSendStamp(name, 1000)
-    claimSendStamp(name, 700)
-    expect(readSendStamp(name)).toBe(1000)
+  test('file holds a different token → superseded', () => {
+    const name = uniqueName('id-other')
+    claimSendToken(name, 'tok-other')
+    expect(isSuperseded(name, 'tok-mine')).toBe(true)
+  })
+})
+
+describe('exactly one survivor under concurrent / replayed claims', () => {
+  test('two distinct claims → only the latest survives (no same-instant tie)', () => {
+    const name = uniqueName('one-survivor')
+    claimSendToken(name, 'tok-A')
+    claimSendToken(name, 'tok-B')
+    expect(isSuperseded(name, 'tok-A')).toBe(true)
+    expect(isSuperseded(name, 'tok-B')).toBe(false)
+  })
+
+  test('a replayed earlier claim cannot leave two survivors', () => {
+    const name = uniqueName('no-two-survivors')
+    claimSendToken(name, 'tok-A')
+    claimSendToken(name, 'tok-B')
+    claimSendToken(name, 'tok-A') // an older send's write landing late / replayed
+    const survivors = ['tok-A', 'tok-B'].filter((t) => !isSuperseded(name, t))
+    // Exactly one token is ever the non-superseded survivor — whoever claimed
+    // last — never both. (A magnitude/max-wins scheme could leave two here.)
+    expect(survivors).toEqual(['tok-A'])
+  })
+})
+
+describe('waitForTurnEnd supersede wiring', () => {
+  test('returns {superseded} when the token file holds a different token', async () => {
+    const name = uniqueName('wait-superseded')
+    seedTeammateSid(name)
+    claimSendToken(name, 'newer-token')
+
+    const verdict = await waitForTurnEnd(
+      name,
+      60,
+      false,
+      fakeTmuxAlive(name),
+      { jsonl: null, sinceBytes: 0 },
+      'my-token',
+    )
+
+    expect(verdict).toEqual({ superseded: true })
+  })
+
+  test('a null token (non-participating send) never reports superseded', async () => {
+    const name = uniqueName('wait-null-token')
+    seedTeammateSid(name)
+    claimSendToken(name, 'whatever')
+
+    const verdict = await waitForTurnEnd(
+      name,
+      0,
+      false,
+      fakeTmuxAlive(name),
+      { jsonl: null, sinceBytes: 0 },
+      null,
+    )
+
+    // --timeout 0 falls straight through to the ordinary expiry, never the
+    // supersede branch, because this send claimed no token.
+    expect(verdict).toEqual({ ok: false })
   })
 })
 
 describe('claudeSend returns early when superseded', () => {
-  test('a newer send token present → exit 0 with a supersede note, not 124', async () => {
+  test('a newer send claims during the wait → exit 0 with a supersede note, not 124', async () => {
     const name = uniqueName('send-superseded')
     seedTeammateSid(name)
-    // A later send has already claimed a stamp far in the future, so this
-    // send's own (real-now) claim is a max-wins no-op and the wait loop sees
-    // itself superseded on the first iteration — before any sleep, so the
-    // large --timeout is never actually waited out.
-    seedSendToken(name, Date.now() + 3_600_000)
 
-    const result = await claudeSend([name, '--prompt', 'guidance', '--timeout', '60'], fakeEnv(name))
+    const result = await claudeSend(
+      [name, '--prompt', 'guidance', '--timeout', '60'],
+      envWith(fakeTmuxInjectingLater(name, 'a-newer-send-token')),
+    )
 
     expect(result.code).toBe(0)
     expect(result.code).not.toBe(EXIT_SYNC_WAIT_EXPIRED)
     expect(result.stdout).toBe('')
     expect(result.stderr).toContain('superseded')
     expect(result.stderr).toContain(name)
-    // The note must point the agent at where the merged reply lands.
     expect(result.stderr).toMatch(/later send|merged|tm wait/)
+  })
+})
+
+describe('claim happens only after delivery succeeds', () => {
+  test('a send whose delivery fails does NOT claim the token (no false supersede)', async () => {
+    const name = uniqueName('send-fail-deliver')
+    seedTeammateSid(name)
+    // An earlier send is already waiting on this teammate (it owns the token).
+    claimSendToken(name, 'earlier-send')
+
+    const result = await claudeSend(
+      [name, '--prompt', 'g2', '--timeout', '0'],
+      envWith(fakeTmuxFailDelivery(name)),
+    )
+
+    // The delivery failed, so this send is a hard failure (exit 1) and must
+    // NOT have overwritten the earlier send's token.
+    expect(result.code).toBe(1)
+    expect(result.code).not.toBe(0)
+    expect(readSendToken(name)).toBe('earlier-send')
+    // …so the earlier waiting send is NOT superseded by this failed delivery.
+    expect(isSuperseded(name, 'earlier-send')).toBe(false)
   })
 })
 
@@ -182,10 +276,11 @@ describe('a normal single send is unaffected (sync contract intact)', () => {
   test('no later send → still takes the normal expiry path (124), never the supersede note', async () => {
     const name = uniqueName('send-normal')
     seedTeammateSid(name)
-    // No future token: this send claims its own real-now stamp, is never
-    // superseded, and with --timeout 0 falls straight through to the
-    // existing sync-wait-expiry contract.
-    const result = await claudeSend([name, '--prompt', 'hi', '--timeout', '0'], fakeEnv(name))
+
+    const result = await claudeSend(
+      [name, '--prompt', 'hi', '--timeout', '0'],
+      envWith(fakeTmuxAlive(name)),
+    )
 
     expect(result.code).toBe(EXIT_SYNC_WAIT_EXPIRED)
     expect(result.stderr).toContain('sync wait expired')

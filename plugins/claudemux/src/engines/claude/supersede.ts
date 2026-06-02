@@ -5,69 +5,89 @@
  *
  * Each `tm send` is a separate `node` process; they share no memory and
  * coordinate only through files (same discipline as the idle/busy markers).
- * A send claims a millisecond stamp — its invocation order — in
- * `/tmp/teammate-<name>.send-token` at start, and treats itself as
- * superseded the moment the file holds a stamp newer than its own. The
- * latest send always carries the greatest stamp, so it never sees a newer
- * one and is the single survivor that keeps waiting for the merged reply.
+ * A send claims a **unique single-use token** in
+ * `/tmp/teammate-<name>.send-token` and treats itself as superseded the
+ * moment the file no longer holds its own token.
  *
- * The claim is **max-wins**: a send writes its stamp only when it is newer
- * than (or as new as) what is already on disk. That makes the file robust
- * to write-ordering races — an older send whose write lands late cannot
- * regress the file to its (smaller) stamp and resurrect itself, and it
- * makes the predicate cleanly testable (seed a future stamp; a real-now
- * claim is a no-op and the send observes itself superseded).
+ * Two properties make this safe under concurrency:
+ *
+ *  - **Atomic last-claim-wins, by identity.** A claim is a temp-write +
+ *    `rename` (atomic on the same filesystem), so concurrent claims never
+ *    tear and the file always holds exactly one complete token. Supersede is
+ *    decided by token *identity* (`current !== mine`), never by comparing
+ *    millisecond magnitudes — so two sends in the same millisecond cannot
+ *    tie, and a late/replayed write cannot leave the file in a state where
+ *    two sends both consider themselves the survivor. Exactly one token is
+ *    ever the survivor: whoever claimed last.
+ *  - **Claim only after delivery.** The caller claims only after `sendKeys`
+ *    lands the prompt, so a send that fails to deliver never retires an
+ *    earlier waiting send with a false "your result merges into mine"
+ *    promise.
  *
  * Claude-only for now: `claudeSend` is the sole writer/reader. The Codex
  * engine drives its own transport and does not participate.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 
 import { sendTokenFile } from '../../persistence/paths'
 import type { TeammateName } from '../types'
 
-/** This send's claim stamp — its invocation order, in epoch milliseconds. */
-export function mintSendStamp(): number {
-  return Date.now()
+/**
+ * A unique, single-use claim token for one `tm send`. The time and pid
+ * prefixes aid debugging; uniqueness comes from the random suffix, so two
+ * sends minted in the same millisecond (even were they the same process)
+ * still get distinct tokens — identity comparison then never ties.
+ */
+export function mintSendToken(): string {
+  return `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomBytes(8).toString('hex')}`
 }
 
-/** Read the teammate's current send-token stamp, or `null` when absent / unparseable. */
-export function readSendStamp(name: TeammateName): number | null {
+/** Read the teammate's current send-token, or `null` when absent / unreadable / empty. */
+export function readSendToken(name: TeammateName): string | null {
   let raw: string
   try {
     raw = readFileSync(sendTokenFile(name), 'utf8')
   } catch {
     return null
   }
-  const stamp = Number.parseInt(raw.trim(), 10)
-  return Number.isFinite(stamp) ? stamp : null
+  const token = raw.trim()
+  return token.length > 0 ? token : null
 }
 
 /**
- * Record `stamp` as the latest send's claim — max-wins, so an older send
- * never overwrites a newer claim. Best-effort: a failed write degrades to
- * "no supersede detection" (the send falls back to waiting for its Stop),
- * never to a crash.
+ * Record `token` as this send's claim — atomically (temp file + `rename`),
+ * so a concurrent reader never sees a torn token and a concurrent claim
+ * cannot interleave into a half-written file. Returns `true` when the claim
+ * landed on disk; `false` on any I/O error, so the caller can decline to
+ * participate in supersede rather than mistake a write failure for "a newer
+ * send claimed" (which `isSuperseded` would otherwise read from a stale
+ * token).
  */
-export function claimSendStamp(name: TeammateName, stamp: number): void {
-  const current = readSendStamp(name)
-  if (current !== null && current > stamp) return
+export function claimSendToken(name: TeammateName, token: string): boolean {
+  const target = sendTokenFile(name)
+  const tmp = `${target}.${process.pid.toString(36)}.${randomBytes(6).toString('hex')}.tmp`
   try {
-    writeFileSync(sendTokenFile(name), `${stamp}\n`)
+    writeFileSync(tmp, `${token}\n`)
+    renameSync(tmp, target)
+    return true
   } catch {
-    // Best-effort — supersede detection is an optimization over the
-    // existing wait, not a correctness requirement.
+    try {
+      rmSync(tmp, { force: true })
+    } catch {
+      // best-effort temp cleanup
+    }
+    return false
   }
 }
 
 /**
- * Whether a strictly-newer send has claimed this teammate since `myStamp`
- * was minted. Equal stamps are not superseded (that is this very send
- * re-reading its own claim, or — in the practically-impossible same-
- * millisecond tie — a fall-back to the ordinary wait for both).
+ * Whether a later send has claimed this teammate since `myToken` — i.e. the
+ * file holds a token that is not mine. A claim that never landed (no token
+ * file) is not a supersession.
  */
-export function isSuperseded(name: TeammateName, myStamp: number): boolean {
-  const current = readSendStamp(name)
-  return current !== null && current > myStamp
+export function isSuperseded(name: TeammateName, myToken: string): boolean {
+  const current = readSendToken(name)
+  return current !== null && current !== myToken
 }

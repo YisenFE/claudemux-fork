@@ -16,7 +16,7 @@
 import { writeFileSync } from 'node:fs'
 
 import { sendKeys } from './keys'
-import { claimSendStamp, mintSendStamp } from './supersede'
+import { claimSendToken, mintSendToken } from './supersede'
 import { confirmSubmit, probeStillAlive, waitForTurnEnd, waitPaneQuiet } from './wait-signals'
 import { echoCtxToStderr, printLastOrEmpty } from './post-turn'
 import { transcriptFile } from './ctx'
@@ -53,18 +53,6 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
     return die(`tm send: --timeout must be a non-negative integer (got: '${timeout}')`)
   }
 
-  // Claim this send's place in the teammate's send order BEFORE delivering
-  // it, so a later `tm send` to the same teammate (a second steering prompt)
-  // claims a greater stamp and this send observes itself superseded — and
-  // returns early instead of waiting for a Stop that the merged turn now
-  // settles under the later send. `mint` first (invocation order), then a
-  // max-wins `claim` so a slow write cannot regress a newer send's claim.
-  // Auto-supersede is a property of normal Stop-waiting sends only;
-  // `--pane-quiet` drives hook-less TUI commands, not steering prompts, so
-  // it neither claims nor checks.
-  const sendStamp = paneQuiet ? 0 : mintSendStamp()
-  if (!paneQuiet) claimSendStamp(name, sendStamp)
-
   // Snapshot the transcript offset BEFORE sending so submit-confirmation
   // and the JSONL wait fallback only read what THIS turn appends — never
   // a prior turn's settled entry. `null` when the transcript path cannot
@@ -79,6 +67,23 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
   const sentResult = await sendKeys(name, prompt, env.runTmux, process.env)
   if (sentResult.code !== 0) return sentResult
 
+  // Claim this send's place in the teammate's send order — but ONLY now that
+  // the prompt has actually landed. A later `tm send` to the same teammate (a
+  // second steering prompt) then claims a fresh token; this send sees the
+  // token is no longer its own and returns early instead of waiting for a
+  // Stop the merged turn now settles under the later send. Claiming after
+  // delivery is load-bearing: a send that failed to deliver must not retire
+  // an earlier waiting send with a false "your result merges into mine"
+  // promise. `--pane-quiet` (hook-less TUI commands, not steering prompts)
+  // neither claims nor checks; a claim that fails to land yields a null token
+  // so this send simply waits as usual rather than mistaking the failure for
+  // a supersession.
+  let sendToken: string | null = null
+  if (!paneQuiet) {
+    const token = mintSendToken()
+    if (claimSendToken(name, token)) sendToken = token
+  }
+
   // Confirm the prompt was accepted as a turn (not swallowed by a modal).
   // Warn-and-proceed only — never converts a slow-but-live send into a
   // failure; the wait below still expires to 124 if the turn never runs.
@@ -92,7 +97,7 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
   const timeoutSec = timeout === null ? 1800 : Number(timeout)
   const verdict = paneQuiet
     ? await waitPaneQuiet(name, timeoutSec, env.runTmux)
-    : await waitForTurnEnd(name, timeoutSec, false, env.runTmux, anchor, sendStamp)
+    : await waitForTurnEnd(name, timeoutSec, false, env.runTmux, anchor, sendToken)
   if ('code' in verdict) return { ...verdict, stderr: confirmStderr + verdict.stderr }
   if ('superseded' in verdict) {
     // A newer `tm send` to this teammate arrived before this turn settled.

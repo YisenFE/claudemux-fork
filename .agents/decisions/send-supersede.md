@@ -36,17 +36,24 @@ unchanged.
 Mechanism — a file-only protocol between the otherwise-independent `tm send`
 processes (same discipline as the idle/busy markers; they share no memory):
 
-- Each send claims a millisecond stamp — its invocation order — in
-  `/tmp/teammate-<name>.send-token` at start
+- Each send claims a **unique single-use token** in
+  `/tmp/teammate-<name>.send-token`
   ([`sendTokenFile`](/plugins/claudemux/src/persistence/paths.ts),
   [`supersede.ts`](/plugins/claudemux/src/engines/claude/supersede.ts)).
-- The claim is **max-wins** (write only a stamp ≥ what is on disk), so a
-  slow write from an older send cannot regress the file and resurrect
-  itself. The latest send always holds the greatest stamp.
+- The claim is an **atomic temp-write + `rename`** (last-claim-wins), and
+  supersede is decided by token **identity** (`current !== mine`), never by
+  comparing millisecond magnitudes. So two sends in the same millisecond
+  cannot tie, and a late/replayed write cannot leave the file in a state
+  where two sends both consider themselves the survivor — exactly one token
+  is ever the survivor, whoever claimed last.
+- The claim happens **only after `sendKeys` lands the prompt**, so a send
+  that fails to deliver never retires an earlier waiting send with a false
+  promise. A claim that fails to write yields a null token, so that send
+  simply waits as usual rather than mistaking the failure for a supersession.
 - The wait loop
   ([`waitForTurnEnd`](/plugins/claudemux/src/engines/claude/wait-signals.ts))
-  treats itself as superseded the moment the file holds a stamp strictly
-  greater than its own, and returns `{ superseded: true }`.
+  treats itself as superseded the moment the file holds a token other than
+  its own, and returns `{ superseded: true }`.
 - The superseded send exits 0 with a stderr note: the prompt was delivered
   and is queued into the teammate's current run; its result merges into the
   later send's turn, so collect the combined reply from that send (or
@@ -78,8 +85,8 @@ Codex engine drives its own transport and is unchanged.
   strand it. The survivor's own `clearIdle` + fresh-Stop wait is unchanged.
 - A new per-teammate protocol file (`.send-token`) joins the `/tmp` seam. No
   hook reads it (it coordinates `tm send` processes only), so it has no Bash
-  mirror; a stale stamp is always in the past and harmless (the next send's
-  larger stamp overwrites it).
+  mirror; a leftover token from a finished send is harmless (the next send's
+  claim atomically replaces it before that send begins its wait).
 - This refines [multi-engine-tui-architecture](/.agents/decisions/multi-engine-tui-architecture.md)'s
   "round-trips are atomic by default": a send is still atomic, but a later
   send to the same teammate now retires an earlier one's wait. It does **not**
