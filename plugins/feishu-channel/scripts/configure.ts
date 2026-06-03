@@ -197,8 +197,28 @@ async function main(): Promise<void> {
   // than at the next channel boot.
   const result = interpretTokenResponse(await probeCredentials(baseUrl, appId, appSecret))
   console.log(`[${result.verdict}] ${result.message}`)
+
+  // The tenant-access-token probe confirms the credentials but cannot enumerate
+  // the app's granted permission scopes — Feishu exposes no scope-listing
+  // endpoint for a self-built app — so this is an explicit reminder, not an
+  // automated check. The message-resource read scope is the one easy to miss; a
+  // missing scope is not fatal (downloads degrade to placeholders), so it stays
+  // a warning rather than a failing verdict.
+  console.log(SCOPE_REMINDER)
+
   process.exit(EXIT_CODE[result.verdict])
 }
+
+/** Operator-facing reminder about scopes configure cannot verify automatically. */
+export const SCOPE_REMINDER = [
+  '',
+  'Reminder: this verified the credentials, not the app permission scopes —',
+  'Feishu does not expose those to verify here. Make sure the app was granted',
+  'the message-resource read scope (im:resource) so the channel can',
+  'download images and files from messages. Without it, attachments are still',
+  'delivered, but as fetch-it-yourself placeholders instead of local file paths.',
+  "The app's permission console lists each scope; see the channel README.",
+].join('\n')
 
 // Run `main` when invoked as the program entry, not when a test imports this
 // module. `realpathSync` canonicalizes the invocation path so it matches the

@@ -106,6 +106,7 @@ for the rationale.
 | `src/identity-store.ts` | App-wide `open_id → name` map for peer bots (per `appId`, cross-chat) |
 | `src/chat-bots-store.ts` | Per-`(appId, chatId)` bot membership + one-shot injection state |
 | `src/bot-discovery.ts` | Auto-observe + the baseline/delta context builder with its commit hook |
+| `src/inbound-content.ts` | Inbound message body → normalized Markdown (the daemon's own renderer) |
 | `src/handlers/*.ts` | One module per Feishu event type |
 | `src/*.ts` | Core logic — access control, content parsing, pairing, … |
 | `scripts/configure.ts` | Credential factory — writes `.env`, verifies against Feishu |
@@ -139,6 +140,18 @@ so it unit-tests without a running server or connection.
   arrives with an empty body, the endpoint is the thing to check before the
   bot's scopes; see
   [decision feishu-doc-comment-fetch-via-batch-query](/.agents/decisions/feishu-doc-comment-fetch-via-batch-query.md).
+- **Inbound bodies are normalized to Markdown in the daemon, not in the shared
+  `@excitedjs/feishu-transport` package.** `src/inbound-content.ts`
+  (`formatInboundContent`) re-parses `message.content` itself rather than calling
+  the package's `parseInbound`, because the normalized form needs a post link's
+  `href` (which the package's text flattening discards) and it downloads
+  attachments. The walk there deliberately mirrors, not imports, the package's,
+  so the package stays untouched and dreamux/Dbotmux are unaffected. Top-level
+  image/file attachments are downloaded via `transport.downloadInboundResource`
+  (SDK `im.messageResource.get → writeFile`) to `/tmp/feishu-inbound/`; any
+  failure or unsupported/oversized resource falls back to a lark-cli token-ref
+  placeholder and never drops the message. sticker, merge-forward inner
+  resources, and files over 100 MB are not downloadable per Feishu's API.
 - Group messages are gated by `access.json`'s `groupPolicy`, set by
   `/feishu-channel:configure`: `block` (the bot ignores groups), `allowlist`
   (each group authorized as a unit by pairing — decision feishu-channel-group-pairing), or

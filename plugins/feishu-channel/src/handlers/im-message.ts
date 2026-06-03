@@ -11,9 +11,10 @@
 
 import { gate, isBotSenderType, isGroupAuthorized } from '../access'
 import { loadAccess, saveAccess } from '../access-store'
-import { mentionName, parseInbound } from '@excitedjs/feishu-transport'
+import { mentionName } from '@excitedjs/feishu-transport'
 import type { ChannelDelivery, EventHandler, HandlerContext } from '../events'
 import { asString, isRecord } from '@excitedjs/feishu-transport'
+import { formatInboundContent } from '../inbound-content'
 import { recordBotIdentity } from '../identity-store'
 import { enqueuePendingNewBot, readChatBots, recordChatMember } from '../chat-bots-store'
 import { buildDiscoveryContext, observeBotSender } from '../bot-discovery'
@@ -54,12 +55,6 @@ export function createImMessageHandler(): EventHandler {
     async handle(raw: unknown, ctx: HandlerContext): Promise<ChannelDelivery | null> {
       const event = normalizeInboundEvent(raw)
       if (!event) return null
-
-      const parsed = parseInbound({
-        message_type: event.messageType,
-        content: event.content,
-        mentions: event.mentions,
-      })
 
       const loaded = loadAccess(ctx.accessFile)
       if (loaded.corrupt) {
@@ -169,8 +164,18 @@ export function createImMessageHandler(): EventHandler {
                 now: ctx.now(),
               })
             : undefined
-          const content =
-            discovery && discovery.prefix ? discovery.prefix + parsed.text : parsed.text
+          // Normalize the body to Markdown here, on the deliver path only, so a
+          // dropped or paired message never triggers an attachment download.
+          const body = await formatInboundContent(
+            {
+              messageId: event.messageId,
+              messageType: event.messageType,
+              content: event.content,
+              mentions: event.mentions,
+            },
+            (req) => ctx.transport.downloadInboundResource(req),
+          )
+          const content = discovery && discovery.prefix ? discovery.prefix + body : body
           return { content, meta: buildMeta(event), commit: discovery?.commit }
         }
         case 'drop':
@@ -223,8 +228,8 @@ const INTRODUCE_RE = /^\/introduce(?:\s|$)/i
  *
  * Detection operates on the raw message content (before mention-key → display-name
  * replacement) and strips leading mention keys by exact match. This is necessary
- * because display names can contain spaces: after `parseInbound` replaces `@_user_1`
- * with `@Claude Code`, a word-boundary regex only strips `@Claude` and leaves
+ * because display names can contain spaces: once `@_user_1` is rendered as
+ * `@Claude Code`, a word-boundary regex only strips `@Claude` and leaves
  * `Code @Bot B /introduce` unmatched. Stripping the original Feishu placeholder
  * tokens (e.g. `@_user_1`) is safe because they never contain spaces.
  *

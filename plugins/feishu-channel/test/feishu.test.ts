@@ -117,10 +117,17 @@ function stubClient() {
   const update = vi.fn(async () => ({}))
   const reactionCreate = vi.fn(async () => ({ data: { reaction_id: 'rk_stub' } }))
   const reactionDelete = vi.fn(async () => ({}))
+  const writeFile = vi.fn(async () => undefined)
+  const resourceGet = vi.fn(async () => ({
+    writeFile,
+    getReadableStream: () => undefined,
+    headers: { 'content-type': 'image/png' },
+  }))
   const stub = {
     im: {
       message: { create, reply, patch, update },
       messageReaction: { create: reactionCreate, delete: reactionDelete },
+      messageResource: { get: resourceGet },
     },
     drive: {
       fileComment: { batchQuery: vi.fn(async () => ({ data: { items: [] } })) },
@@ -136,6 +143,8 @@ function stubClient() {
     update,
     reactionCreate,
     reactionDelete,
+    resourceGet,
+    writeFile,
   }
 }
 
@@ -501,5 +510,98 @@ describe('createFeishuTransport — editText', () => {
     )
     expect(stub.patch).not.toHaveBeenCalled()
     expect(stub.update).not.toHaveBeenCalled()
+  })
+})
+
+describe('createFeishuTransport — downloadInboundResource', () => {
+  test('downloads an image, naming the file from the response content-type', async () => {
+    const stub = stubClient()
+    const transport = buildTransport(stub)
+
+    const path = await transport.downloadInboundResource({
+      messageId: 'om_x',
+      fileKey: 'img_k',
+      type: 'image',
+    })
+
+    expect(path).toBe('/tmp/feishu-inbound/om_x-img_k.png')
+    const calls = stub.resourceGet.mock.calls as unknown as Array<
+      [{ params: { type: string }; path: { message_id: string; file_key: string } }]
+    >
+    expect(calls[0]?.[0]).toEqual({
+      params: { type: 'image' },
+      path: { message_id: 'om_x', file_key: 'img_k' },
+    })
+    expect(stub.writeFile).toHaveBeenCalledWith('/tmp/feishu-inbound/om_x-img_k.png')
+  })
+
+  test('downloads a file, naming it from the original file name extension', async () => {
+    const stub = stubClient()
+    const transport = buildTransport(stub)
+
+    const path = await transport.downloadInboundResource({
+      messageId: 'om_x',
+      fileKey: 'file_k',
+      type: 'file',
+      fileName: 'report.pdf',
+    })
+
+    expect(path).toBe('/tmp/feishu-inbound/om_x-file_k.pdf')
+    const calls = stub.resourceGet.mock.calls as unknown as Array<
+      [{ params: { type: string } }]
+    >
+    expect(calls[0]?.[0]?.params.type).toBe('file')
+  })
+
+  test('an image with no content-type defaults to a .png extension', async () => {
+    const stub = stubClient()
+    stub.resourceGet.mockResolvedValueOnce({
+      writeFile: stub.writeFile,
+      getReadableStream: () => undefined,
+      headers: {},
+    } as never)
+    const transport = buildTransport(stub)
+
+    const path = await transport.downloadInboundResource({
+      messageId: 'om_x',
+      fileKey: 'img_k',
+      type: 'image',
+    })
+
+    expect(path).toBe('/tmp/feishu-inbound/om_x-img_k.png')
+  })
+
+  test('a failed download returns null rather than throwing', async () => {
+    const stub = stubClient()
+    stub.resourceGet.mockRejectedValueOnce(new Error('missing scope'))
+    const transport = buildTransport(stub)
+
+    const path = await transport.downloadInboundResource({
+      messageId: 'om_x',
+      fileKey: 'file_k',
+      type: 'file',
+      fileName: 'report.pdf',
+    })
+
+    expect(path).toBeNull()
+  })
+
+  test('a crafted file_key cannot write outside the inbound cache directory', async () => {
+    const stub = stubClient()
+    const transport = buildTransport(stub)
+
+    const path = await transport.downloadInboundResource({
+      messageId: 'om_x',
+      fileKey: 'a/../../../etc/passwd',
+      type: 'image',
+    })
+
+    // The download still succeeds, but to a sanitized, contained path — the
+    // separators were neutralized so it stays a direct child of the cache dir.
+    expect(path).not.toBeNull()
+    expect(path?.startsWith('/tmp/feishu-inbound/')).toBe(true)
+    expect(path?.slice('/tmp/feishu-inbound/'.length).includes('/')).toBe(false)
+    const writeCalls = stub.writeFile.mock.calls as unknown as Array<[string]>
+    expect(writeCalls[0]?.[0]).toBe(path)
   })
 })

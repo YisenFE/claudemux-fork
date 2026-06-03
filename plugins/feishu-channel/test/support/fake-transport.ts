@@ -9,6 +9,7 @@ import type {
   FeishuDocMeta,
   FeishuSendResult,
   FeishuTransport,
+  InboundResourceRequest,
 } from '../../src/feishu'
 import { renderMarkdownToCards } from '@excitedjs/feishu-transport'
 
@@ -35,6 +36,14 @@ export class FakeTransport implements FeishuTransport {
   docComment: FeishuDocComment | null = null
   /** Canned `fetchDocMeta` result; `null` simulates a failed enrichment. */
   docMeta: FeishuDocMeta | null = null
+  /** Records every `downloadInboundResource` call. */
+  readonly downloads: InboundResourceRequest[] = []
+  /**
+   * Canned `downloadInboundResource` result: a path string for a successful
+   * download, or `null` to simulate a failed/unsupported download. Defaults to
+   * `null` so a test must opt into a successful download.
+   */
+  downloadResult: string | null = null
 
   constructor(botOpenId?: string, appId: string = 'cli_test_app') {
     this.botOpenId = botOpenId
@@ -82,6 +91,11 @@ export class FakeTransport implements FeishuTransport {
   async editText(messageId: string, text: string): Promise<void> {
     if (this.failOn === 'editText') throw new Error('feishu edit failed')
     this.edits.push({ messageId, text })
+  }
+
+  async downloadInboundResource(req: InboundResourceRequest): Promise<string | null> {
+    this.downloads.push(req)
+    return this.downloadResult
   }
 
   async fetchDocComment(

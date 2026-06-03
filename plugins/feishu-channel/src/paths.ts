@@ -11,7 +11,7 @@
  */
 
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 
 /** Root of all channel state: ~/.claude/channels/feishu */
 export function stateDir(home?: string): string {
@@ -67,4 +67,47 @@ export function botIdentityFile(base: string, appId: string): string {
  */
 export function chatBotsFile(base: string, appId: string, chatId: string): string {
   return join(base, `feishu-chat-bots-${appId}-${chatId}.json`)
+}
+
+/**
+ * /tmp/feishu-inbound — the local cache for downloaded inbound message
+ * resources (top-level images and files). Fixed under /tmp, deliberately
+ * outside the channel state directory, so the OS reclaims it on its own (macOS
+ * clears untouched /tmp entries after a few days; Linux per its tmpfiles
+ * policy) and the channel writes no cleanup: a notification is asynchronous, so
+ * a downloaded file must outlive the gap between delivery and the model's Read.
+ * The absolute path is embedded verbatim in the delivered body for Read to open.
+ */
+export function inboundResourceDir(): string {
+  return join('/tmp', 'feishu-inbound')
+}
+
+/**
+ * Reduce one externally-supplied path component (a message_id, file_key, or
+ * extension) to filename-safe characters. message_id / file_key reach us
+ * straight from attacker-influenced message JSON, so a value like
+ * `a/../../etc` must not survive as path separators on disk.
+ */
+function safePathComponent(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, '_')
+}
+
+/**
+ * Absolute on-disk path for one downloaded resource:
+ * `<inboundResourceDir>/<messageId>-<fileKey><ext>`. `messageId` (`om_...`) is
+ * unique per message and `fileKey` (`img_v2_...` / `file_v2_...`) per resource,
+ * so the pair never collides. Each component is reduced to filename-safe
+ * characters first — Feishu ids are already safe, so this is lossless for real
+ * values and neutralizes a crafted `file_key` — and the resolved path is then
+ * asserted to stay inside the cache directory, refusing a traversal rather than
+ * writing through it. `ext` carries its own leading dot (or is empty).
+ */
+export function inboundResourcePath(messageId: string, fileKey: string, ext: string): string {
+  const dir = resolve(inboundResourceDir())
+  const name = `${safePathComponent(messageId)}-${safePathComponent(fileKey)}${safePathComponent(ext)}`
+  const full = resolve(dir, name)
+  if (full !== dir && !full.startsWith(dir + sep)) {
+    throw new Error('refusing to write a downloaded resource outside the inbound cache directory')
+  }
+  return full
 }

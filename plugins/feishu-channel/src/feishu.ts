@@ -17,8 +17,11 @@
  * loses the lock stands by and polls, so a crashed holder is taken over.
  */
 
+import { chmodSync, mkdirSync } from 'node:fs'
+
 import * as lark from '@larksuiteoapi/node-sdk'
 
+import { inboundResourceDir, inboundResourcePath } from './paths'
 import {
   connectionErrorLogLine,
   reconnectedLogLine,
@@ -35,6 +38,14 @@ import { cardToContent, renderMarkdownToCards, type RenderedCard } from '@excite
 
 /** Cap on a single WebSocket handshake before it is aborted into a retry. */
 const WS_HANDSHAKE_TIMEOUT_MS = 15_000
+
+/**
+ * How long one resource download is given before it is abandoned. Feishu's own
+ * 100 MB limit bounds the size; this bounds the wait, so a slow or stuck
+ * transfer falls back to a token-ref placeholder instead of holding up the
+ * whole inbound delivery.
+ */
+const RESOURCE_DOWNLOAD_TIMEOUT_MS = 15_000
 
 /**
  * How long the initial connection is given to come up before the channel
@@ -91,6 +102,21 @@ export interface FeishuSendResult {
    * with the message_id; otherwise it is the `chat_id` the send was routed to.
    */
   chatId: string
+}
+
+/**
+ * A request to download one top-level inbound message resource. `type` is the
+ * resource kind the `messageResource.get` API expects — `image` for an image
+ * message's `image_key`, `file` for a file message's `file_key` — and `fileKey`
+ * is that key's value. `fileName` (a file's original name) supplies the on-disk
+ * extension for a `file`; an image's extension is read from the download
+ * response's content-type instead.
+ */
+export interface InboundResourceRequest {
+  messageId: string
+  fileKey: string
+  type: 'image' | 'file'
+  fileName?: string
 }
 
 /**
@@ -394,6 +420,15 @@ export interface FeishuTransport {
   removeReaction(messageId: string, reactionId: string): Promise<void>
   /** Replace the text of a message the bot previously sent. */
   editText(messageId: string, text: string): Promise<void>
+  /**
+   * Download a top-level message resource (a chat image or file) into the local
+   * inbound cache and return its absolute path, or `null` when it could not be
+   * downloaded — an unsupported resource, one over Feishu's 100 MB limit, a
+   * missing scope, a timeout, or any other failure. Never throws: the caller
+   * renders a token-ref placeholder instead, so a failed download degrades the
+   * message rather than dropping it.
+   */
+  downloadInboundResource(req: InboundResourceRequest): Promise<string | null>
   /**
    * Fetch one document comment and its reply thread. The comment-add event
    * payload carries no comment text, so the doc-comment handler calls this to
@@ -752,6 +787,32 @@ export function createFeishuTransport(
       }
     },
 
+    async downloadInboundResource(req: InboundResourceRequest): Promise<string | null> {
+      try {
+        // TODO: the timeout bounds the wait but does not cancel the underlying
+        // SDK `get` / `writeFile` — a hung transfer keeps its handle until it
+        // settles. Acceptable for v1: inbound messages are processed
+        // sequentially and a message carries at most one top-level attachment,
+        // so there is no concurrent fan-out to accumulate handles. Wire an
+        // AbortController (or switch to `getReadableStream` + `destroy`) if v1
+        // ever gains concurrent or inline-image downloads.
+        return await withTimeout(
+          downloadResourceToDisk(client, req),
+          RESOURCE_DOWNLOAD_TIMEOUT_MS,
+        )
+      } catch (err) {
+        // Every failure mode — unsupported type, over the size limit, a missing
+        // scope, a timeout — lands here and degrades to a token-ref placeholder.
+        // The message is still delivered; only the local copy is missing.
+        console.error(
+          `[feishu-channel] could not download ${req.type} resource ${req.fileKey} ` +
+            `on message ${req.messageId}:`,
+          err,
+        )
+        return null
+      }
+    },
+
     async fetchDocComment(
       fileToken: string,
       fileType: string,
@@ -943,5 +1004,99 @@ function raceConnectionReady(ready: Promise<void>, graceMs: number): Promise<boo
       clearTimeout(timer)
       resolve(true)
     })
+  })
+}
+
+/**
+ * Download one message resource to `inboundResourceDir()` and return its path.
+ * The extension is chosen so Claude Code's `Read` recognizes the file: a file
+ * keeps its original name's extension, an image's comes from the response
+ * content-type (default `.png`). Throws on any SDK or filesystem failure;
+ * `downloadInboundResource` catches it and falls back to a token-ref.
+ */
+async function downloadResourceToDisk(
+  client: lark.Client,
+  req: InboundResourceRequest,
+): Promise<string> {
+  const res = await client.im.messageResource.get({
+    params: { type: req.type },
+    path: { message_id: req.messageId, file_key: req.fileKey },
+  })
+  const ext =
+    req.type === 'file'
+      ? extFromFileName(req.fileName)
+      : extFromContentType(readContentType(res.headers))
+  // `inboundResourcePath` sanitizes the externally-supplied id/key/ext and
+  // refuses a path that escapes the cache dir, so a crafted file_key cannot
+  // write outside the inbound cache.
+  const path = inboundResourcePath(req.messageId, req.fileKey, ext)
+  const dir = inboundResourceDir()
+  // Owner-only directory: a downloaded resource may be private and /tmp is
+  // world-readable. mkdir's mode is umask-masked and only applies on create, so
+  // chmod also covers a pre-existing or stricter-umask directory. This is the
+  // load-bearing boundary — no other user can enter a 0700 directory they do
+  // not own — so a failure here propagates and the download falls back.
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  chmodSync(dir, 0o700)
+  await res.writeFile(path)
+  // Tighten the file to owner-only too (defense in depth on top of the 0700
+  // directory). Best-effort: the file is already written and protected by the
+  // directory mode, so a chmod hiccup must not discard a good download.
+  try {
+    chmodSync(path, 0o600)
+  } catch {
+    /* directory mode already restricts access; file-mode tightening is a bonus */
+  }
+  return path
+}
+
+/** The lower-cased extension (with leading dot) of a file name, or '' if none. */
+function extFromFileName(fileName: string | undefined): string {
+  if (!fileName) return ''
+  const dot = fileName.lastIndexOf('.')
+  if (dot <= 0 || dot === fileName.length - 1) return ''
+  return fileName.slice(dot).toLowerCase()
+}
+
+/** Read the `content-type` value from the SDK's loosely-typed headers bag. */
+function readContentType(headers: unknown): string {
+  if (!headers || typeof headers !== 'object') return ''
+  const value = (headers as Record<string, unknown>)['content-type']
+  return typeof value === 'string' ? value : ''
+}
+
+/** Map an image download's content-type to a `Read`-recognized extension. */
+function extFromContentType(contentType: string): string {
+  const type = contentType.split(';')[0]?.trim().toLowerCase() ?? ''
+  switch (type) {
+    case 'image/png':
+      return '.png'
+    case 'image/jpeg':
+      return '.jpg'
+    case 'image/gif':
+      return '.gif'
+    case 'image/webp':
+      return '.webp'
+    case 'image/bmp':
+      return '.bmp'
+    default:
+      return '.png'
+  }
+}
+
+/** Reject with a timeout error if `promise` does not settle within `ms`. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err: unknown) => {
+        clearTimeout(timer)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      },
+    )
   })
 }
