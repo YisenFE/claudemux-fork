@@ -1,6 +1,6 @@
 {
   "name": "claude-channel-feishu",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Feishu (飞书) channel for Claude Code.",
   "license": "MIT",
   "type": "module",
