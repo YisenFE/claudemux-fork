@@ -9,16 +9,19 @@
 # (compact is the main path: every compaction re-fires SessionStart and
 # refreshes the recall, not just a cold start).
 #
-# DISPATCHER-ONLY, via two env gates that must BOTH hold:
+# DISPATCHER-ONLY, via three gates that must ALL hold:
 #   1) TM_DISPATCHER_DIR is set. `/claudemux:setup` writes it into the
 #      dispatcher root's .claude/settings.json, so Claude Code injects it on
-#      dispatcher launch. An ad-hoc `claude` with no claudemux config has it
-#      unset → no-op.
+#      dispatcher launch. A session with no claudemux config has it unset.
 #   2) CLAUDEMUX_TEAMMATE_NAME is NOT set. A `tm spawn` teammate inherits the
 #      dispatcher's TM_DISPATCHER_DIR through the tmux server environment, so
-#      gate 1 alone would also fire inside teammates and pollute their
-#      context. The teammate identity env is the positive signal that this is
-#      a teammate; its absence is what makes the hook dispatcher-only.
+#      the env alone does not distinguish a teammate; the teammate-identity
+#      env's absence does.
+#   3) The SessionStart cwd resolves to TM_DISPATCHER_DIR. This is the
+#      authoritative check: TM_DISPATCHER_DIR can leak into any session
+#      launched from a shell that exported it, but only the dispatcher session
+#      actually runs *in* that directory. Gates 1–2 are the cheap fast-path
+#      and defense-in-depth; gate 3 is what makes "dispatcher-only" true.
 #
 # This hook ships in the plugin's hooks.json (like the other four), so the
 # `${CLAUDE_PLUGIN_ROOT}` path is re-resolved to the current plugin version on
@@ -31,9 +34,22 @@
 
 set -u
 
-# Gate 1: dispatcher-configured session. Gate 2: not a teammate.
+# Gate 1 (dispatcher-configured) and gate 2 (not a teammate) are cheap env
+# checks that fast-path out of the common non-dispatcher session.
 [[ -n "${TM_DISPATCHER_DIR:-}" ]] || exit 0
 [[ -z "${CLAUDEMUX_TEAMMATE_NAME:-}" ]] || exit 0
+
+# Gate 3 — the authoritative dispatcher check: the firing session's cwd must
+# resolve to TM_DISPATCHER_DIR. The cwd arrives in the SessionStart hook's
+# JSON stdin (the same shape on-session-start.sh reads). Resolve both sides
+# with `cd … && pwd -P` so a symlinked dispatcher path or a logical-vs-physical
+# difference still matches; a missing/empty dir resolves to empty and fails.
+input="$(cat 2>/dev/null || true)"
+hook_cwd="$(printf '%s' "$input" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+resolve_dir() { (cd "$1" 2>/dev/null && pwd -P) || true; }
+dispatcher_real="$(resolve_dir "$TM_DISPATCHER_DIR")"
+cwd_real="$(resolve_dir "$hook_cwd")"
+[[ -n "$dispatcher_real" && "$cwd_real" == "$dispatcher_real" ]] || exit 0
 
 # Required tools, both guarded: `tm` provides the history, `jq` builds the
 # JSON with correct string escaping (history intent/name fields are arbitrary
@@ -53,11 +69,14 @@ history_text="$(tm history --since "$RECALL_SINCE" --oneline --limit "$RECALL_LI
 [[ -n "$history_text" ]] || exit 0
 
 # Character budget for the injected history. additionalContext rides in the
-# context window every session start and every compact, so keep it bounded
-# (~10k cap for the whole string; 9000 here leaves room for the header and
-# pointer). History is newest-first, so truncating the TAIL keeps the most
-# recent rows; trim back to a line boundary so no row is cut mid-string, and
-# append an on-demand pointer to query the rest.
+# context window on every startup and compaction, so keep it bounded. Claude
+# Code measures the additionalContext limit in characters (10,000); a 9000
+# budget leaves room for the header and pointer. `${#var}` counts characters
+# in a UTF-8 locale and bytes under LC_ALL=C, and bytes ≥ characters for
+# multibyte text, so 9000 stays under the 10,000-character cap either way.
+# History is newest-first, so truncating the TAIL keeps the most recent rows;
+# trim back to a line boundary so no row is cut mid-string, then append an
+# on-demand pointer to query the rest.
 HISTORY_BUDGET=9000
 pointer=""
 if [[ ${#history_text} -gt $HISTORY_BUDGET ]]; then

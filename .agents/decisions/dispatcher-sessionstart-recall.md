@@ -34,10 +34,16 @@ Two supporting choices make it robust:
   plugin's `hooks.json` instead uses `${CLAUDE_PLUGIN_ROOT}`, re-resolved to
   the current version every launch, and the script calls bare `tm` (Claude
   Code prepends each plugin's `bin/` to PATH) — both version-stable. The hook
-  self-gates on `TM_DISPATCHER_DIR` set **and** `CLAUDEMUX_TEAMMATE_NAME`
-  unset; both gates are required because a `tm spawn` teammate inherits
-  `TM_DISPATCHER_DIR` through the tmux server environment, so the first gate
-  alone would fire inside teammates and pollute their context.
+  gates three ways: `TM_DISPATCHER_DIR` set, `CLAUDEMUX_TEAMMATE_NAME` unset,
+  and — the authoritative check — the SessionStart `cwd` realpath-equal to
+  `TM_DISPATCHER_DIR`. The cwd check is what actually pins it to the
+  dispatcher: `TM_DISPATCHER_DIR` can leak into any session launched from a
+  shell that exported it (and a `tm spawn` teammate inherits it through the
+  tmux server environment), but only the dispatcher runs *in* that directory.
+  Both sides are resolved with `cd … && pwd -P` (pure bash, no `realpath`
+  binary), so a symlinked path — e.g. `TM_DISPATCHER_DIR=/home/u/dev` against a
+  physical cwd `/data00/home/u/dev` — still matches, with no BSD-vs-coreutils
+  `realpath` portability gap.
 
 - **Relative durations were added to `tm history --since/--until`** (`3d`,
   `12h`, `1w`, `30m` → "<N> ago"), so the hook passes `--since 3d` directly
@@ -53,18 +59,22 @@ Two supporting choices make it robust:
 - Every failure mode degrades to `exit 0` with no stdout and no stderr — gates
   unmet, `tm`/`jq` missing, `tm history` non-zero, empty history — because a
   SessionStart hook's stderr reaches the user. The injected string is capped
-  (~10 KB, newest-first truncation with a `tm history --since <window>`
-  pointer) so it does not crowd the context window every compaction.
+  (9000-character budget — Claude Code measures the `additionalContext` limit
+  in characters — with newest-first truncation and a `tm history --since
+  <window>` pointer) so it does not crowd the context window every compaction.
 - **Enforcement against silent regression:**
   [`test/cli/on_session_start_recall.bats`](/plugins/claudemux/test/cli/on_session_start_recall.bats)
-  covers both env gates, the size-cap truncation, the `additionalContext` JSON
-  shape, and the `tm history`-failure degradation;
+  covers all three gates (including a cwd that differs from `TM_DISPATCHER_DIR`
+  by a symlink but resolves equal — which must still inject — and the reverse),
+  the size-cap truncation, the `additionalContext` JSON shape, and the
+  `tm history`-failure degradation;
   [`test/verbs/history-time-flags.test.ts`](/plugins/claudemux/test/verbs/history-time-flags.test.ts)
   covers the relative/absolute/invalid `--since` grammar.
 - **Foot-guns:** do not move the wiring into a `settings.json` hook with an
-  absolute plugin path (version-pinned → stale → per-launch error), and do not
-  drop the `CLAUDEMUX_TEAMMATE_NAME` gate (teammates inherit
-  `TM_DISPATCHER_DIR`).
+  absolute plugin path (version-pinned → stale → per-launch error); do not drop
+  the `CLAUDEMUX_TEAMMATE_NAME` gate (teammates inherit `TM_DISPATCHER_DIR`);
+  and do not weaken the cwd gate to a literal string compare — a real
+  dispatcher whose path crosses a symlink would then be rejected forever.
 
 ## References
 

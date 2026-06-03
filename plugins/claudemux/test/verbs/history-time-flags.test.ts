@@ -105,4 +105,13 @@ describe('--since / --until invalid input', () => {
       expect(err(['--since', bad])).toContain('is not a parseable date/time')
     },
   )
+
+  // A relative token whose millisecond span overflows the safe-integer range
+  // must be rejected, not resolved to a ±Infinity bound.
+  test.each(['99999999999999999w', '9999999999999999999d'])(
+    'overflowing relative duration %s is rejected, not resolved to ±Infinity',
+    (bad) => {
+      expect(err(['--since', bad])).toContain('is not a parseable date/time')
+    },
+  )
 })

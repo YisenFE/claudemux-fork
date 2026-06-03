@@ -86,12 +86,17 @@ Injects the dispatcher's recent `tm history` as SessionStart
 keeps a fresh view of recent teammate work — the `compact` source is the main
 path (every compaction re-fires SessionStart and refreshes the recall).
 
-- **Two env gates, both required.** It runs only when `TM_DISPATCHER_DIR` is
-  set **and** `CLAUDEMUX_TEAMMATE_NAME` is unset. The first marks a
-  claudemux-configured session; the second excludes teammates — a `tm spawn`
-  teammate inherits `TM_DISPATCHER_DIR` through the tmux server environment,
-  so the absence of the teammate-identity env is what makes the hook
-  dispatcher-only. Any other session no-ops.
+- **Three gates, all required.** It runs only when `TM_DISPATCHER_DIR` is set,
+  `CLAUDEMUX_TEAMMATE_NAME` is unset, and the SessionStart `cwd` (from the JSON
+  stdin) realpath-equals `TM_DISPATCHER_DIR`. The first two are cheap env
+  fast-paths; the cwd check is authoritative, because `TM_DISPATCHER_DIR` can
+  leak into any session launched from a shell that exported it (and a teammate
+  inherits it through the tmux server environment), but only the dispatcher
+  runs *in* that directory. Both sides are resolved with `cd … && pwd -P` (pure
+  bash, no `realpath` binary), so a symlinked path — `TM_DISPATCHER_DIR=/home/u/dev`
+  vs a physical cwd `/data00/home/u/dev` — still matches; weakening this to a
+  literal string compare would reject such a dispatcher forever. Any other
+  session no-ops.
 - **`tm` by PATH, never an absolute plugin path.** The script calls bare `tm`
   (Claude Code prepends each plugin's `bin/` to PATH) and ships in the
   plugin's `hooks.json`, so the `${CLAUDE_PLUGIN_ROOT}` wiring re-resolves to
@@ -101,10 +106,11 @@ path (every compaction re-fires SessionStart and refreshes the recall).
   start (below). See
   [decision dispatcher-sessionstart-recall](/.agents/decisions/dispatcher-sessionstart-recall.md).
 - **Bounded, newest-first.** `tm history --since 3d --oneline --limit 50`,
-  then a ~9 KB character budget trims the tail (history is newest-first, so
-  the most recent rows survive) and appends a `tm history --since <window>`
-  pointer for the rest. `jq` builds the JSON so arbitrary intent text is
-  escaped correctly.
+  then a 9000-character budget (Claude Code measures the `additionalContext`
+  limit in characters) trims the tail at a line boundary — history is
+  newest-first, so the most recent rows survive — and appends a
+  `tm history --since <window>` pointer for the rest. `jq` builds the JSON so
+  arbitrary intent text is escaped correctly.
 - **Silent on every failure.** SessionStart cannot block, but its hook's
   stderr is shown to the user on every session start, so each failure mode
   (gates not met, `tm`/`jq` missing, `tm history` non-zero, empty history)

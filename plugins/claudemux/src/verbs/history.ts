@@ -40,7 +40,12 @@ const RELATIVE_DURATION_UNITS_MS: Readonly<Record<string, number>> = {
 function parseRelativeDurationMs(value: string): number | null {
   const match = /^(\d+)([mhdw])$/.exec(value)
   if (match === null) return null
-  return Number(match[1]) * RELATIVE_DURATION_UNITS_MS[match[2]!]!
+  const ms = Number(match[1]) * RELATIVE_DURATION_UNITS_MS[match[2]!]!
+  // A token like "9".repeat(400) + "w" overflows to a non-finite / unsafe
+  // magnitude; reject it (→ falls through to absolute parsing → "not a
+  // parseable date/time") rather than yielding a ±Infinity time bound.
+  if (!Number.isSafeInteger(ms)) return null
+  return ms
 }
 
 function parseTimeFlag(flag: string, value: string): number | TmResult {

@@ -6,18 +6,25 @@
 #
 # A fake `tm` on PATH stands in for the real CLI so each test controls the
 # history output (and its exit code) deterministically; the real `jq` stays
-# reachable through the inherited PATH.
+# reachable through the inherited PATH. The hook reads the SessionStart `cwd`
+# from JSON stdin, so each dispatcher-path test feeds a payload.
 
 setup() {
   load "$BATS_TEST_DIRNAME/../test_helper.bash"
   HOOK="$PLUGIN_ROOT/hooks/on-session-start-recall.sh"
   WORK="$(mktemp -d)"
   BIN="$WORK/bin"
-  mkdir -p "$BIN"
+  DISP="$WORK/dispatcher"
+  mkdir -p "$BIN" "$DISP"
 }
 
 teardown() {
   rm -rf "$WORK"
+}
+
+# A SessionStart hook JSON payload with the given cwd.
+payload() {
+  printf '{"session_id":"s1","cwd":"%s","source":"compact","hook_event_name":"SessionStart"}' "$1"
 }
 
 # Write a fake `tm` that prints the given lines (one per argument) and exits 0.
@@ -38,25 +45,51 @@ write_failing_tm() {
   chmod +x "$BIN/tm"
 }
 
-# Run the hook as a dispatcher session (both gates satisfied) unless overridden.
+# Run the hook as a dispatcher session: both env gates satisfied and the
+# stdin cwd equal to TM_DISPATCHER_DIR.
 run_recall() {
-  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$WORK/dispatcher" \
-    PATH="$BIN:$PATH" bash "$HOOK"
+  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$DISP" \
+    PATH="$BIN:$PATH" bash "$HOOK" <<<"$(payload "$DISP")"
 }
 
 @test "recall: no-op when TM_DISPATCHER_DIR is unset (not a dispatcher session)" {
   write_fake_tm "id1 codex idle repoA t1 should not appear"
-  run env -u TM_DISPATCHER_DIR -u CLAUDEMUX_TEAMMATE_NAME PATH="$BIN:$PATH" bash "$HOOK"
+  run env -u TM_DISPATCHER_DIR -u CLAUDEMUX_TEAMMATE_NAME PATH="$BIN:$PATH" \
+    bash "$HOOK" <<<"$(payload "$DISP")"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
 
-@test "recall: no-op inside a teammate (CLAUDEMUX_TEAMMATE_NAME set) even with TM_DISPATCHER_DIR" {
+@test "recall: no-op inside a teammate (CLAUDEMUX_TEAMMATE_NAME set) even when the cwd matches" {
   write_fake_tm "id1 codex idle repoA t1 should not appear"
-  run env TM_DISPATCHER_DIR="$WORK/dispatcher" CLAUDEMUX_TEAMMATE_NAME=alice \
-    PATH="$BIN:$PATH" bash "$HOOK"
+  run env TM_DISPATCHER_DIR="$DISP" CLAUDEMUX_TEAMMATE_NAME=alice \
+    PATH="$BIN:$PATH" bash "$HOOK" <<<"$(payload "$DISP")"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+@test "recall: no-op when the cwd resolves to a different path than TM_DISPATCHER_DIR (leaked env)" {
+  mkdir -p "$WORK/elsewhere"
+  write_fake_tm "id1 codex idle repoA t1 should not appear"
+  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$DISP" \
+    PATH="$BIN:$PATH" bash "$HOOK" <<<"$(payload "$WORK/elsewhere")"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "recall: injects when cwd and TM_DISPATCHER_DIR differ by a symlink but resolve to the same path" {
+  # The deployment shape observed on a host where the home path is a symlink
+  # (e.g. TM_DISPATCHER_DIR=/home/u/dev, SessionStart cwd=/data00/home/u/dev):
+  # different strings, same realpath. The gate realpath-resolves BOTH sides, so
+  # it must still inject — a literal string compare would wrongly reject it.
+  mkdir -p "$WORK/real"
+  ln -s "$WORK/real" "$WORK/link"
+  write_fake_tm "id1 codex idle repoA t1 real dispatcher work"
+  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$WORK/link" \
+    PATH="$BIN:$PATH" bash "$HOOK" <<<"$(payload "$WORK/real")"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hookSpecificOutput.hookEventName == "SessionStart"' >/dev/null
+  echo "$output" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "id1 codex idle repoA"
 }
 
 @test "recall: dispatcher session emits SessionStart additionalContext JSON" {
@@ -107,11 +140,9 @@ run_recall() {
 }
 
 @test "recall: no-op when tm is not on PATH" {
-  # A minimal PATH that can find `bash` (to run the hook) but not `tm`.
-  mkdir -p "$WORK/minbin"
-  ln -s "$(command -v bash)" "$WORK/minbin/bash"
-  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$WORK/dispatcher" \
-    PATH="$WORK/minbin" bash "$HOOK"
+  # A PATH that can find bash + the stdin-parse tools (cat/sed/head) but not tm.
+  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$DISP" \
+    PATH="/usr/bin:/bin" bash "$HOOK" <<<"$(payload "$DISP")"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
