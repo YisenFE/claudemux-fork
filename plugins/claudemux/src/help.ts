@@ -102,8 +102,11 @@ commands. --timeout defaults to 1800s.
 
 A second tm send to the same teammate while this one is still waiting
 supersedes it: the earlier send returns early (exit 0) with a note on stderr,
-and only the latest send waits for the merged reply. Use this to steer a
-running teammate without waiting for the first send to return.
+and only the latest send keeps waiting for the result. Use this to steer a
+running teammate without waiting for the first send to return; collect the
+result from the latest send, or with tm wait <name> / tm last <name> (a
+queued prompt is answered together with the later send only when it lands at
+a mid-task pause — otherwise it runs as a separate turn).
 
 Exit codes: 0 reply printed (or a supersede note, no reply); 124 wait expired
 but teammate is still running; 1 failure. Re-collect 124 with tm wait <name>

@@ -19,9 +19,12 @@
  *    not retire an earlier waiting send with a false "your result merges
  *    into mine" promise.
  *
- * The "merged result" the dispatcher eventually reads is emergent from
- * Claude Code's own queue behavior; `tm` only lets superseded sends return
- * early and lets the single survivor keep waiting for the final Stop.
+ * What the dispatcher eventually reads is emergent from Claude Code's own
+ * queue behavior — a queued prompt is answered together with the later send
+ * only when that send is injected at a mid-task pause; on a pure-generation
+ * turn it runs as a separate turn (decision send-supersede, "Runtime
+ * behavior"). `tm` only lets superseded sends return early and lets the
+ * single survivor keep waiting for the final Stop.
  */
 
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -246,7 +249,10 @@ describe('claudeSend returns early when superseded', () => {
     expect(result.stdout).toBe('')
     expect(result.stderr).toContain('superseded')
     expect(result.stderr).toContain(name)
-    expect(result.stderr).toMatch(/later send|merged|tm wait/)
+    // The note points the agent at where to collect the result …
+    expect(result.stderr).toMatch(/later send|tm wait|tm last/)
+    // … and does NOT promise an unconditional merge (it may be a separate turn).
+    expect(result.stderr).not.toMatch(/merges into the later send/)
   })
 })
 

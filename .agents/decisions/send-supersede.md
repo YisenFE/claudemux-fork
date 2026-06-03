@@ -55,14 +55,16 @@ processes (same discipline as the idle/busy markers; they share no memory):
   treats itself as superseded the moment the file holds a token other than
   its own, and returns `{ superseded: true }`.
 - The superseded send exits 0 with a stderr note: the prompt was delivered
-  and is queued into the teammate's current run; its result merges into the
-  later send's turn, so collect the combined reply from that send (or
-  `tm wait`).
+  and is queued into the teammate's current run; collect the result from the
+  later send or `tm wait` / `tm last`. The note does **not** promise a single
+  merged reply — whether the queued prompt merges depends on the run (see
+  [Runtime behavior](#runtime-behavior-live-repro)).
 
-The "merged result" is **emergent from Claude Code**, not computed by `tm`:
-queued prompts fold into the run and the model answers them together at the
-final Stop. `tm` only (a) lets every superseded send return early, and
-(b) lets the single survivor wait for that final Stop.
+What the dispatcher reads is **emergent from Claude Code**, not computed by
+`tm`: a queued prompt is folded into the current run and answered together
+with the later send only when that send lands at a mid-task pause; otherwise
+it runs as a separate turn. `tm` only (a) lets every superseded send return
+early, and (b) lets the single survivor wait for the next Stop.
 
 Why exit 0: the prompt *was* delivered, so this is neither a failure (1) nor
 a stuck-but-alive expiry (124). The note carries the semantics; the exit
@@ -73,6 +75,33 @@ Scope: Claude only — `claudeSend` is the sole participant. `--pane-quiet`
 sends (hook-less TUI commands, not steering prompts) neither claim nor
 check. `tm wait` stays a pure recovery seam and does not participate. The
 Codex engine drives its own transport and is unchanged.
+
+## Runtime behavior (live repro)
+
+A live end-to-end run — a real `claude` teammate driven by two concurrent
+sends — confirmed the early return and characterized the merge, which is
+**not** unconditional:
+
+- **Early return works.** In every case the earlier send returned exit 0 with
+  the supersede note within one poll instead of hanging to its timeout.
+- **The earlier turn fires no Stop.** With a message queued, Claude Code does
+  not fire the Stop hook between the busy turn and the queued prompt — which
+  is exactly why the earlier send used to hang, and why the early return is
+  needed.
+- **Merge depends on the injection point:**
+  - *Tool-using / mid-task-pause turn* (the typical "steer a working
+    teammate" case): the queued prompt is injected at the post-tool pause and
+    folded into **one** continued assistant turn — a true merge. The surviving
+    send returns the combined reply (both prompts answered).
+  - *Pure-generation turn with no mid-task pause*: the queued prompt runs as a
+    **separate** next turn — no merge. Worse, the survivor can return an
+    **empty** reply: the queued send's `clearIdle` wiped the `.last` baseline,
+    and the Stops that fire while the queue drains extract an empty `.last`
+    (on-stop's `rm-empty`). The content is still in the transcript — recover
+    it with `tm wait` / `tm last`.
+
+The note wording reflects this: it points at `tm wait` / `tm last` and does
+not promise a single merged reply.
 
 ## Consequences
 
@@ -91,6 +120,18 @@ Codex engine drives its own transport and is unchanged.
   "round-trips are atomic by default": a send is still atomic, but a later
   send to the same teammate now retires an earlier one's wait. It does **not**
   re-introduce the removed `--no-wait` flag — there is no opt-out switch.
+
+## Known follow-ups (not done)
+
+- **Make the survivor's readback reliable in the no-merge case.** A
+  steering/queued send rides the current turn rather than starting a fresh
+  one, so it could skip `clearIdle` (which today wipes the in-flight `.last`
+  baseline) and relax `confirmSubmit` (a queued prompt produces no fresh
+  turn-start signal, so today it spuriously warns and re-sends Enter). Doing
+  both would let the surviving send capture the reply directly instead of
+  relying on a `tm wait` / `tm last` fallback. Deferred: the accepted scope of
+  this record is the honest note plus the [Runtime behavior](#runtime-behavior-live-repro)
+  finding; the supersede logic is unchanged.
 
 ## References
 
