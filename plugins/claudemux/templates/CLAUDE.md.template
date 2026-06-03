@@ -26,6 +26,8 @@ When the user names a repo (exact or fuzzy), pass that sibling repo's absolute p
 
 Use the dispatcher skill for teammate operations. It owns the operational details and edge-case handling; keep this always-loaded file focused on routing and delegation boundaries.
 
+Recent teammate sessions are auto-recalled into context at session start; to look further back, run `tm history --since <window>` (e.g. `1w`, `2w`).
+
 ## Ground rules
 
 A few constraints fall out of the dispatcher running outside any single repo. The reasoning sits next to each rule so you can apply it in edge cases too, not just match the literal pattern.

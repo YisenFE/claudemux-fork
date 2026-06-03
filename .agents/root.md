@@ -34,8 +34,10 @@ Code plugin. The model:
   session, with its working directory set to that repo.
 - The **`tm` CLI** — the bash script the dispatcher uses to spawn, message,
   wait on, inspect, and kill teammates.
-- The **hook bundle** — three hook scripts that fire on every Claude Code
-  session and maintain a file-based BUSY/idle signal that `tm` blocks on.
+- The **hook bundle** — four hook scripts that fire on every Claude Code
+  session: three maintain a file-based BUSY/idle signal that `tm` blocks on,
+  and one (dispatcher-only) injects the dispatcher's recent `tm history` as
+  SessionStart recall context.
 - Two **skills** — `dispatcher` (the teammate-coordination operations
   manual) and `optimize` (periodic self-review of the dispatcher's own
   history).

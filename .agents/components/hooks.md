@@ -1,21 +1,27 @@
 # Component: the hook bundle
 
-Three hook scripts under [`/plugins/claudemux/hooks/`](/plugins/claudemux/hooks)
-maintain the file-based BUSY/idle signal that `tm`'s waiting verbs block on.
-Wiring is declared in [`hooks.json`](/plugins/claudemux/hooks/hooks.json).
+Four hook scripts under [`/plugins/claudemux/hooks/`](/plugins/claudemux/hooks),
+wired in [`hooks.json`](/plugins/claudemux/hooks/hooks.json). Three maintain the
+file-based BUSY/idle signal that `tm`'s waiting verbs block on; the fourth,
+[`on-session-start-recall.sh`](/plugins/claudemux/hooks/on-session-start-recall.sh),
+is dispatcher-only and injects recent `tm history` as SessionStart context (see
+[decision dispatcher-sessionstart-recall](/.agents/decisions/dispatcher-sessionstart-recall.md)).
 
 The hooks fire for **every Claude Code session on the machine** — every
-teammate *and* the dispatcher itself. Markers are keyed by `session_id`, so
-there is no cross-session collision; nothing waits on the dispatcher's own
-markers, so its extra writes are harmless.
+teammate *and* the dispatcher itself. For the three signal hooks that is by
+design: markers are keyed by `session_id`, so there is no cross-session
+collision, and nothing waits on the dispatcher's own markers, so its extra
+writes are harmless. The recall hook also fires on every session but **no-ops
+unless the session is the dispatcher** (env-gated, below) and writes no marker.
 
-## The three scripts
+## The four scripts
 
 | Script | Bound events | Job |
 |---|---|---|
 | [`on-busy.sh`](/plugins/claudemux/hooks/on-busy.sh) | `UserPromptSubmit`, `UserPromptExpansion`, `PreToolUse`, `PreCompact` | Touch `/tmp/claude-idle/<sid>.busy` — the idle→working transition |
 | [`on-stop.sh`](/plugins/claudemux/hooks/on-stop.sh) | `Stop`, `StopFailure`, `PostCompact`, `SessionEnd` | Remove `.busy`, touch the idle marker, and (Stop only) write `<sid>.last` — the working→idle transition |
 | [`on-session-start.sh`](/plugins/claudemux/hooks/on-session-start.sh) | `SessionStart` | Keep `/tmp/teammate-<repo>.sid` in sync when `/clear` or `/resume` rotates the session_id; touch `<repo>.ready` for `tm spawn`'s poll |
+| [`on-session-start-recall.sh`](/plugins/claudemux/hooks/on-session-start-recall.sh) | `SessionStart` (matcher `startup\|resume\|compact`) | Dispatcher-only: inject recent `tm history` as `additionalContext` so recent-work recall refreshes on every compaction |
 
 The event sets for `on-busy.sh` and `on-stop.sh` are chosen to cover *every*
 transition in each direction. Why this matters: if `tm wait` only woke on
@@ -73,8 +79,40 @@ Sid rotation only happens when **both** gates pass:
 
 Each real rotation is appended to `/tmp/claudemux-sid-changes.log`.
 
+## `on-session-start-recall.sh` — dispatcher-only recall
+
+Injects the dispatcher's recent `tm history` as SessionStart
+`additionalContext`, so a dispatcher that rarely restarts and compacts often
+keeps a fresh view of recent teammate work — the `compact` source is the main
+path (every compaction re-fires SessionStart and refreshes the recall).
+
+- **Two env gates, both required.** It runs only when `TM_DISPATCHER_DIR` is
+  set **and** `CLAUDEMUX_TEAMMATE_NAME` is unset. The first marks a
+  claudemux-configured session; the second excludes teammates — a `tm spawn`
+  teammate inherits `TM_DISPATCHER_DIR` through the tmux server environment,
+  so the absence of the teammate-identity env is what makes the hook
+  dispatcher-only. Any other session no-ops.
+- **`tm` by PATH, never an absolute plugin path.** The script calls bare `tm`
+  (Claude Code prepends each plugin's `bin/` to PATH) and ships in the
+  plugin's `hooks.json`, so the `${CLAUDE_PLUGIN_ROOT}` wiring re-resolves to
+  the current plugin version every launch. Writing a version-pinned plugin
+  path into a settings.json hook would 404 after the next plugin update — and
+  a SessionStart hook failure surfaces its stderr to the user on every session
+  start (below). See
+  [decision dispatcher-sessionstart-recall](/.agents/decisions/dispatcher-sessionstart-recall.md).
+- **Bounded, newest-first.** `tm history --since 3d --oneline --limit 50`,
+  then a ~9 KB character budget trims the tail (history is newest-first, so
+  the most recent rows survive) and appends a `tm history --since <window>`
+  pointer for the rest. `jq` builds the JSON so arbitrary intent text is
+  escaped correctly.
+- **Silent on every failure.** SessionStart cannot block, but its hook's
+  stderr is shown to the user on every session start, so each failure mode
+  (gates not met, `tm`/`jq` missing, `tm history` non-zero, empty history)
+  degrades to `exit 0` with no stdout and no stderr.
+
 ## See also
 
 - [domains/cross-process-protocol.md](/.agents/domains/cross-process-protocol.md) — every protocol file the hooks read and write.
 - [components/tm.md](/.agents/components/tm.md) — the consumer side of the signal.
 - [decisions/hook-driven-busy-idle-signal.md](/.agents/decisions/hook-driven-busy-idle-signal.md) — why the signal is hook-driven.
+- [decisions/dispatcher-sessionstart-recall.md](/.agents/decisions/dispatcher-sessionstart-recall.md) — why recall is a plugin SessionStart hook, dispatcher-gated.

@@ -1,5 +1,5 @@
 {
-  "description": "claudemux hook bundle that drives the dispatcher's hook-based BUSY/idle signal. on-busy.sh sets /tmp/claude-idle/<sid>.busy on the FOUR events that transition a Claude session from idle → working (UserPromptSubmit, UserPromptExpansion, PreToolUse, PreCompact). on-stop.sh clears that marker, writes <sid>.last (Stop only), and touches the idle signal on the FOUR events that transition a session back to idle/gone (Stop, StopFailure, PostCompact, SessionEnd). on-session-start.sh keeps /tmp/teammate-<name>.sid in sync when /clear rotates the session_id (without it, tm states/last/wait-idle all consult a dead sid). Hooks fire for every Claude session on the machine including the dispatcher itself; nothing waits on the dispatcher's own files, so the extra writes are harmless. Implementations are in on-busy.sh, on-stop.sh, and on-session-start.sh.",
+  "description": "claudemux hook bundle that drives the dispatcher's hook-based BUSY/idle signal. on-busy.sh sets /tmp/claude-idle/<sid>.busy on the FOUR events that transition a Claude session from idle → working (UserPromptSubmit, UserPromptExpansion, PreToolUse, PreCompact). on-stop.sh clears that marker, writes <sid>.last (Stop only), and touches the idle signal on the FOUR events that transition a session back to idle/gone (Stop, StopFailure, PostCompact, SessionEnd). on-session-start.sh keeps /tmp/teammate-<name>.sid in sync when /clear rotates the session_id (without it, tm states/last/wait-idle all consult a dead sid). on-session-start-recall.sh runs only in the dispatcher session (gated on TM_DISPATCHER_DIR set AND CLAUDEMUX_TEAMMATE_NAME unset) on the startup|resume|compact sources, injecting recent `tm history` as SessionStart additionalContext so the dispatcher's recent-work recall refreshes on every compaction. Hooks fire for every Claude session on the machine including the dispatcher itself; nothing waits on the dispatcher's own files, so the extra writes are harmless. Implementations are in on-busy.sh, on-stop.sh, on-session-start.sh, and on-session-start-recall.sh.",
   "hooks": {
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-busy.sh\"" } ] }
@@ -26,7 +26,8 @@
       { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-stop.sh\"" } ] }
     ],
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-session-start.sh\"" } ] }
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-session-start.sh\"" } ] },
+      { "matcher": "startup|resume|compact", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-session-start-recall.sh\"" } ] }
     ]
   }
 }

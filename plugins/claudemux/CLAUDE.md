@@ -8,7 +8,7 @@ Depth lives in the KB (repo-root `.agents/`, not shipped to users): start at `.a
 
 - `bin/tm` — thin bash launcher; in a source plugin checkout it execs `node` against `src/main.ts` under `--experimental-transform-types` (no build step, no `node_modules`); in an npm package install it delegates to `dist/tm.mjs`.
 - `src/` — the `tm` CLI source: verbs, dispatch, help, the Claude and Codex engines, persistence, identity. → `.agents/components/tm.md`, `.agents/components/claudemux-core.md`.
-- `hooks/` — `on-busy.sh`, `on-stop.sh`, `on-session-start.sh`; wiring in `hooks/hooks.json`. These maintain the BUSY/idle turn signal `tm`'s waiting verbs block on. → `.agents/components/hooks.md`.
+- `hooks/` — `on-busy.sh`, `on-stop.sh`, `on-session-start.sh`, `on-session-start-recall.sh`; wiring in `hooks/hooks.json`. The first three maintain the BUSY/idle turn signal `tm`'s waiting verbs block on; the recall hook is dispatcher-only and injects recent `tm history` as SessionStart context. → `.agents/components/hooks.md`.
 - `skills/dispatcher/SKILL.md` — teammate-coordination ops manual (the verbs the dispatcher drives); `skills/optimize/SKILL.md` — periodic dispatcher self-review.
 - `commands/setup.md` + `scripts/setup.sh` + `templates/CLAUDE.md.template` — the `/claudemux:setup` onboarding flow and the dispatcher seed.
 
