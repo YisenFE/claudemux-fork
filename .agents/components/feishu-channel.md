@@ -146,12 +146,13 @@ so it unit-tests without a running server or connection.
   the package's `parseInbound`, because the normalized form needs a post link's
   `href` (which the package's text flattening discards) and it downloads
   attachments. The walk there deliberately mirrors, not imports, the package's,
-  so the package stays untouched and dreamux/Dbotmux are unaffected. Top-level
-  image/file attachments are downloaded via `transport.downloadInboundResource`
-  (SDK `im.messageResource.get → writeFile`) to `/tmp/feishu-inbound/`; any
-  failure or unsupported/oversized resource falls back to a lark-cli token-ref
-  placeholder and never drops the message. sticker, merge-forward inner
-  resources, and files over 100 MB are not downloadable per Feishu's API.
+  so the package stays untouched and dreamux/Dbotmux are unaffected. Image/file
+  attachments — top-level, and images inlined in posts (`image_key`) and cards
+  (`img_key`) — are downloaded via `transport.downloadInboundResource` (SDK
+  `im.messageResource.get → writeFile`) to `/tmp/feishu-inbound/`; any failure or
+  unsupported/oversized resource falls back to a lark-cli token-ref placeholder
+  and never drops the message. sticker, merge-forward inner resources, and files
+  over 100 MB are not downloadable per Feishu's API.
 - Group messages are gated by `access.json`'s `groupPolicy`, set by
   `/feishu-channel:configure`: `block` (the bot ignores groups), `allowlist`
   (each group authorized as a unit by pairing — decision feishu-channel-group-pairing), or
