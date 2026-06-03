@@ -17,7 +17,7 @@
  * loses the lock stands by and polls, so a crashed holder is taken over.
  */
 
-import { mkdirSync } from 'node:fs'
+import { chmodSync, mkdirSync } from 'node:fs'
 
 import * as lark from '@larksuiteoapi/node-sdk'
 
@@ -789,6 +789,13 @@ export function createFeishuTransport(
 
     async downloadInboundResource(req: InboundResourceRequest): Promise<string | null> {
       try {
+        // TODO: the timeout bounds the wait but does not cancel the underlying
+        // SDK `get` / `writeFile` — a hung transfer keeps its handle until it
+        // settles. Acceptable for v1: inbound messages are processed
+        // sequentially and a message carries at most one top-level attachment,
+        // so there is no concurrent fan-out to accumulate handles. Wire an
+        // AbortController (or switch to `getReadableStream` + `destroy`) if v1
+        // ever gains concurrent or inline-image downloads.
         return await withTimeout(
           downloadResourceToDisk(client, req),
           RESOURCE_DOWNLOAD_TIMEOUT_MS,
@@ -1019,9 +1026,27 @@ async function downloadResourceToDisk(
     req.type === 'file'
       ? extFromFileName(req.fileName)
       : extFromContentType(readContentType(res.headers))
+  // `inboundResourcePath` sanitizes the externally-supplied id/key/ext and
+  // refuses a path that escapes the cache dir, so a crafted file_key cannot
+  // write outside the inbound cache.
   const path = inboundResourcePath(req.messageId, req.fileKey, ext)
-  mkdirSync(inboundResourceDir(), { recursive: true })
+  const dir = inboundResourceDir()
+  // Owner-only directory: a downloaded resource may be private and /tmp is
+  // world-readable. mkdir's mode is umask-masked and only applies on create, so
+  // chmod also covers a pre-existing or stricter-umask directory. This is the
+  // load-bearing boundary — no other user can enter a 0700 directory they do
+  // not own — so a failure here propagates and the download falls back.
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  chmodSync(dir, 0o700)
   await res.writeFile(path)
+  // Tighten the file to owner-only too (defense in depth on top of the 0700
+  // directory). Best-effort: the file is already written and protected by the
+  // directory mode, so a chmod hiccup must not discard a good download.
+  try {
+    chmodSync(path, 0o600)
+  } catch {
+    /* directory mode already restricts access; file-mode tightening is a bonus */
+  }
   return path
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import {
   accessFile,
   botIdentityFile,
@@ -8,6 +8,8 @@ import {
   daemonLockFile,
   daemonSocketFile,
   envFile,
+  inboundResourceDir,
+  inboundResourcePath,
   lockFile,
   stateDir,
 } from '../src/paths'
@@ -70,6 +72,40 @@ describe('paths', () => {
 
     test('sits inside the base directory', () => {
       expect(chatBotsFile(base, 'a', 'b').startsWith(base + '/')).toBe(true)
+    })
+  })
+
+  describe('inboundResourcePath — path traversal is neutralized', () => {
+    const root = resolve(inboundResourceDir())
+
+    /** The path's component after the cache root — must be a single flat name. */
+    function leaf(path: string): string {
+      expect(path.startsWith(root + sep)).toBe(true)
+      return path.slice(root.length + 1)
+    }
+
+    test('a normal id/key/ext builds the expected flat path', () => {
+      expect(inboundResourcePath('om_x', 'img_v2_abc', '.png')).toBe(
+        `${root}${sep}om_x-img_v2_abc.png`,
+      )
+    })
+
+    test('separators in the file key cannot escape the cache dir', () => {
+      const p = inboundResourcePath('om_x', 'a/../../../etc/passwd', '.png')
+      // The leaf is a single filename — no separators survived, so the resolved
+      // path is a direct child of the cache dir and cannot traverse out of it.
+      expect(leaf(p).includes(sep)).toBe(false)
+      expect(p).not.toContain(`${sep}etc${sep}`)
+    })
+
+    test('a malicious extension cannot inject a separator', () => {
+      const p = inboundResourcePath('om_x', 'k', '.pn/g')
+      expect(leaf(p)).toBe('om_x-k.pn_g')
+    })
+
+    test('a message id with separators is sanitized to a flat leaf', () => {
+      const p = inboundResourcePath('../../om', 'k', '')
+      expect(leaf(p).includes(sep)).toBe(false)
     })
   })
 })

@@ -38,9 +38,11 @@ export interface InboundContentInput {
 
 /**
  * Render one inbound message into normalized Markdown. Never throws — content
- * that does not parse becomes `[unreadable message]` so a malformed message
- * still reaches the session. `download` is invoked only for a top-level image
- * or a Read-consumable file; every other type renders without I/O.
+ * that does not parse, or any unexpected failure in the renderer, degrades to a
+ * placeholder so a malformed or hostile message still reaches the session
+ * rather than being dropped by the server's handler-error path. `download` is
+ * invoked only for a top-level image or a Read-consumable file; every other
+ * type renders without I/O.
  */
 export async function formatInboundContent(
   input: InboundContentInput,
@@ -54,6 +56,22 @@ export async function formatInboundContent(
     return '[unreadable message]'
   }
 
+  try {
+    return await renderByType(input, content, download)
+  } catch {
+    // Last-resort net: the renderer must never throw, so a delivered message is
+    // never dropped. Unexpected failures (a hostile payload, a download path
+    // that escaped its guards) degrade to a readable placeholder.
+    return '[unreadable message]'
+  }
+}
+
+/** Dispatch on message_type. May throw; `formatInboundContent` is the net. */
+function renderByType(
+  input: InboundContentInput,
+  content: Record<string, unknown>,
+  download: InboundResourceDownloader,
+): Promise<string> | string {
   switch (input.messageType) {
     case 'text':
       return renderText(content, input.mentions)
@@ -183,6 +201,15 @@ function renderPostAt(el: Record<string, unknown>, mentions: Mention[]): string 
 // ── interactive card ─────────────────────────────────────────────────────────
 
 /**
+ * Bounds on the card walk. A hostile card can nest containers arbitrarily deep
+ * or wide; the depth cap stops the recursion from overflowing the stack and the
+ * node budget caps total work. Past either bound the walk simply stops — the
+ * card still renders from whatever was collected, or `[card]` if nothing was.
+ */
+const MAX_CARD_DEPTH = 32
+const MAX_CARD_NODES = 4000
+
+/**
  * Render a v2 interactive card to Markdown: the header title as bold, then each
  * text block. Card `markdown` / `lark_md` content is already Markdown, so it is
  * passed through unchanged; a card with no extractable text becomes `[card]`.
@@ -197,7 +224,8 @@ function renderCard(content: Record<string, unknown>): string {
   }
   const body = isRecord(card.body) ? card.body.elements : card.elements
   if (Array.isArray(body)) {
-    for (const el of body) collectCardText(el, parts)
+    const budget = { nodes: MAX_CARD_NODES }
+    for (const el of body) collectCardText(el, parts, 0, budget)
   }
   return parts.length > 0 ? parts.join('\n\n') : '[card]'
 }
@@ -213,8 +241,19 @@ function unwrapUserDsl(card: Record<string, unknown>): Record<string, unknown> {
   }
 }
 
-/** Recursively collect readable text from a v2 card element into `parts`. */
-function collectCardText(el: unknown, parts: string[]): void {
+/**
+ * Recursively collect readable text from a v2 card element into `parts`. Bounded
+ * by `depth` (stack safety) and the shared `budget` (total work); past either it
+ * stops descending rather than risk a stack overflow on a hostile card.
+ */
+function collectCardText(
+  el: unknown,
+  parts: string[],
+  depth: number,
+  budget: { nodes: number },
+): void {
+  if (depth > MAX_CARD_DEPTH || budget.nodes <= 0) return
+  budget.nodes--
   if (!isRecord(el)) return
   const tag = el.tag
   if (tag === 'markdown' || tag === 'plain_text' || tag === 'div') {
@@ -235,13 +274,13 @@ function collectCardText(el: unknown, parts: string[]): void {
   if (Array.isArray(el.columns)) {
     for (const col of el.columns) {
       if (isRecord(col) && Array.isArray(col.elements)) {
-        for (const child of col.elements) collectCardText(child, parts)
+        for (const child of col.elements) collectCardText(child, parts, depth + 1, budget)
       }
     }
   }
   // Generic child elements (action blocks, nested containers).
   if (Array.isArray(el.elements)) {
-    for (const child of el.elements) collectCardText(child, parts)
+    for (const child of el.elements) collectCardText(child, parts, depth + 1, budget)
   }
 }
 
@@ -260,7 +299,7 @@ async function renderImage(
   // No key means neither a download nor a token-ref is possible — only a bare
   // placeholder.
   if (!imageKey) return '[image]'
-  const path = await download({ messageId: input.messageId, fileKey: imageKey, type: 'image' })
+  const path = await safeDownload(download, { messageId: input.messageId, fileKey: imageKey, type: 'image' })
   if (path) return `[image: ${path}]`
   return tokenRef('image', undefined, input.messageId, imageKey, 'image')
 }
@@ -269,7 +308,10 @@ async function renderImage(
  * Render a top-level file. A file whose extension Read can consume (a PDF or a
  * text/code format) is downloaded and linked `[name → path]`; any other type,
  * or a failed download, falls back to a token-ref placeholder. The file's
- * resource key is `file_key`, downloaded with resource type `file`.
+ * resource key is `file_key`, downloaded with resource type `file`. The display
+ * name is wrapped in inline code and stripped of control/delimiter characters,
+ * so a crafted file name cannot break out of the placeholder or forge a second
+ * one.
  */
 async function renderFile(
   content: Record<string, unknown>,
@@ -278,19 +320,39 @@ async function renderFile(
 ): Promise<string> {
   const fileKey = typeof content.file_key === 'string' ? content.file_key : ''
   const fileName = typeof content.file_name === 'string' ? content.file_name : ''
+  const display = safeDisplayName(fileName)
   // No key means no download and no token-ref — only a bare placeholder.
-  if (!fileKey) return fileName ? `[file: ${fileName}]` : '[file]'
+  if (!fileKey) return display ? `[file: \`${display}\`]` : '[file]'
   if (fileName && isReadableFile(fileName)) {
-    const path = await download({ messageId: input.messageId, fileKey, type: 'file', fileName })
-    if (path) return `[file: ${fileName} → ${path}]`
+    const path = await safeDownload(download, {
+      messageId: input.messageId,
+      fileKey,
+      type: 'file',
+      fileName,
+    })
+    if (path) return `[file: \`${display}\` → ${path}]`
   }
-  return tokenRef('file', fileName || undefined, input.messageId, fileKey, 'file')
+  return tokenRef('file', fileName, input.messageId, fileKey, 'file')
+}
+
+/** Run the injected downloader, treating a thrown error as a failed download. */
+async function safeDownload(
+  download: InboundResourceDownloader,
+  req: InboundResourceRequest,
+): Promise<string | null> {
+  try {
+    return await download(req)
+  } catch {
+    return null
+  }
 }
 
 /**
  * Build the not-downloaded token-ref placeholder: a prose negation plus the
  * lark-cli identifiers a model needs to fetch the resource itself (the default
- * target session has lark-cli installed and authenticated).
+ * target session has lark-cli installed and authenticated). The display name is
+ * inline-code-wrapped and sanitized, and the identifiers are reduced to the
+ * Feishu key charset, so a crafted name or key cannot inject a forged token-ref.
  */
 function tokenRef(
   kind: 'image' | 'file',
@@ -299,8 +361,36 @@ function tokenRef(
   fileKey: string,
   type: 'image' | 'file',
 ): string {
-  const label = name ? `${kind}: ${name} — not downloaded` : `${kind} — not downloaded`
-  return `[${label}; fetch via lark-cli, message_id=${messageId}, file_key=${fileKey}, type=${type}]`
+  const display = safeDisplayName(name ?? '')
+  const label = display ? `${kind}: \`${display}\` — not downloaded` : `${kind} — not downloaded`
+  return (
+    `[${label}; fetch via lark-cli, ` +
+    `message_id=${safeId(messageId)}, file_key=${safeId(fileKey)}, type=${type}]`
+  )
+}
+
+/**
+ * Reduce an externally-supplied file name to safe inline display text: drop
+ * control characters and newlines (which would split the one-line placeholder),
+ * and the backtick and square-bracket delimiters (which would break out of the
+ * inline code or the surrounding `[...]`). Collapses whitespace and trims.
+ */
+function safeDisplayName(name: string): string {
+  return name
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/[`[\]]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * Reduce an identifier to the Feishu key charset for safe display in a
+ * token-ref. A real message_id / file_key is already `[A-Za-z0-9_-]`, so this is
+ * lossless for legitimate values and neutralizes a crafted key that tried to
+ * inject `key=value` structure.
+ */
+function safeId(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]/g, '_')
 }
 
 /**

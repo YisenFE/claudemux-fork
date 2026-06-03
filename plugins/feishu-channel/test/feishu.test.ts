@@ -585,4 +585,23 @@ describe('createFeishuTransport — downloadInboundResource', () => {
 
     expect(path).toBeNull()
   })
+
+  test('a crafted file_key cannot write outside the inbound cache directory', async () => {
+    const stub = stubClient()
+    const transport = buildTransport(stub)
+
+    const path = await transport.downloadInboundResource({
+      messageId: 'om_x',
+      fileKey: 'a/../../../etc/passwd',
+      type: 'image',
+    })
+
+    // The download still succeeds, but to a sanitized, contained path — the
+    // separators were neutralized so it stays a direct child of the cache dir.
+    expect(path).not.toBeNull()
+    expect(path?.startsWith('/tmp/feishu-inbound/')).toBe(true)
+    expect(path?.slice('/tmp/feishu-inbound/'.length).includes('/')).toBe(false)
+    const writeCalls = stub.writeFile.mock.calls as unknown as Array<[string]>
+    expect(writeCalls[0]?.[0]).toBe(path)
+  })
 })

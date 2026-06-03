@@ -11,7 +11,7 @@
  */
 
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 
 /** Root of all channel state: ~/.claude/channels/feishu */
 export function stateDir(home?: string): string {
@@ -83,12 +83,31 @@ export function inboundResourceDir(): string {
 }
 
 /**
+ * Reduce one externally-supplied path component (a message_id, file_key, or
+ * extension) to filename-safe characters. message_id / file_key reach us
+ * straight from attacker-influenced message JSON, so a value like
+ * `a/../../etc` must not survive as path separators on disk.
+ */
+function safePathComponent(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, '_')
+}
+
+/**
  * Absolute on-disk path for one downloaded resource:
  * `<inboundResourceDir>/<messageId>-<fileKey><ext>`. `messageId` (`om_...`) is
  * unique per message and `fileKey` (`img_v2_...` / `file_v2_...`) per resource,
- * and both contain only filename-safe characters, so the pair never collides.
- * `ext` carries its own leading dot (or is empty when no extension is known).
+ * so the pair never collides. Each component is reduced to filename-safe
+ * characters first — Feishu ids are already safe, so this is lossless for real
+ * values and neutralizes a crafted `file_key` — and the resolved path is then
+ * asserted to stay inside the cache directory, refusing a traversal rather than
+ * writing through it. `ext` carries its own leading dot (or is empty).
  */
 export function inboundResourcePath(messageId: string, fileKey: string, ext: string): string {
-  return join(inboundResourceDir(), `${messageId}-${fileKey}${ext}`)
+  const dir = resolve(inboundResourceDir())
+  const name = `${safePathComponent(messageId)}-${safePathComponent(fileKey)}${safePathComponent(ext)}`
+  const full = resolve(dir, name)
+  if (full !== dir && !full.startsWith(dir + sep)) {
+    throw new Error('refusing to write a downloaded resource outside the inbound cache directory')
+  }
+  return full
 }

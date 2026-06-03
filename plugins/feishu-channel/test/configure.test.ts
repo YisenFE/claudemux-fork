@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   DEFAULT_FEISHU_BASE,
+  SCOPE_REMINDER,
   interpretTokenResponse,
   parseGroupPolicy,
   renderEnvFile,
@@ -11,6 +12,15 @@ import {
   validateCredentialInput,
 } from '../scripts/configure'
 import { readEnvFile } from '../src/server'
+
+describe('SCOPE_REMINDER', () => {
+  test('names the message-resource scope and is honest that it is unverified', () => {
+    expect(SCOPE_REMINDER).toContain('message-resource')
+    expect(SCOPE_REMINDER).toMatch(/not.*scope|does not expose/i)
+    // It is a warning, not a fatal verdict — attachments still degrade gracefully.
+    expect(SCOPE_REMINDER).toContain('placeholder')
+  })
+})
 
 describe('validateCredentialInput', () => {
   test('accepts a well-formed pair', () => {
