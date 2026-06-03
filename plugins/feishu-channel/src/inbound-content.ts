@@ -58,7 +58,10 @@ export async function formatInboundContent(
   }
 
   try {
-    return await renderByType(input, content, download)
+    // One inline-image download budget per message, shared across every post and
+    // card inline image, so a single message cannot trigger unbounded fetches.
+    const imageBudget: ImageBudget = { remaining: MAX_INLINE_IMAGE_DOWNLOADS }
+    return await renderByType(input, content, download, imageBudget)
   } catch {
     // Last-resort net: the renderer must never throw, so a delivered message is
     // never dropped. Unexpected failures (a hostile payload, a download path
@@ -67,19 +70,35 @@ export async function formatInboundContent(
   }
 }
 
+/**
+ * Per-message budget for inline-image downloads. Each download is a network
+ * round-trip plus a disk write under a 15s timeout, so the count is bounded far
+ * below the card node budget (`MAX_CARD_NODES`, which bounds cheap in-memory
+ * parse work): a crafted post or card with hundreds of inline images must not
+ * fan out into hundreds of fetches. Once exhausted, further inline images render
+ * as token-refs without a download.
+ */
+interface ImageBudget {
+  remaining: number
+}
+
+/** Cap on inline-image downloads per inbound message. */
+const MAX_INLINE_IMAGE_DOWNLOADS = 16
+
 /** Dispatch on message_type. May throw; `formatInboundContent` is the net. */
 function renderByType(
   input: InboundContentInput,
   content: Record<string, unknown>,
   download: InboundResourceDownloader,
+  imageBudget: ImageBudget,
 ): Promise<string> | string {
   switch (input.messageType) {
     case 'text':
       return renderText(content, input.mentions)
     case 'post':
-      return renderPost(content, input.mentions)
+      return renderPost(content, input.mentions, input, download, imageBudget)
     case 'interactive':
-      return renderCard(content)
+      return renderCard(content, input, download, imageBudget)
     case 'image':
       return renderImage(content, input, download)
     case 'file':
@@ -139,21 +158,37 @@ function applyMentions(text: string, mentions: Mention[]): string {
 /**
  * Render a Feishu rich-text "post" as Markdown: the title as bold on its own
  * line, paragraphs separated by blank lines, links as `[text](href)`, inline
- * images as `[image]`, and @-mentions resolved. A post is locale-wrapped
- * (`{ zh_cn: { title, content } }`); the body is an array of paragraphs, each an
- * array of tagged inline elements.
+ * images downloaded to a local path (or a token-ref on failure), and @-mentions
+ * resolved. A post is locale-wrapped (`{ zh_cn: { title, content } }`); the body
+ * is an array of paragraphs, each an array of tagged inline elements. The title
+ * is sanitized so a crafted post cannot break out of the bold span.
  */
-function renderPost(content: Record<string, unknown>, mentions: Mention[]): string {
+async function renderPost(
+  content: Record<string, unknown>,
+  mentions: Mention[],
+  input: InboundContentInput,
+  download: InboundResourceDownloader,
+  imageBudget: ImageBudget,
+): Promise<string> {
   const post = pickPostLocale(content)
   const blocks: string[] = []
   if (typeof post.title === 'string' && post.title.trim() !== '') {
-    blocks.push(`**${post.title}**`)
+    const title = safeInlineText(post.title)
+    if (title) blocks.push(`**${title}**`)
   }
   const body = post.content
   if (Array.isArray(body)) {
     for (const paragraph of body) {
       if (!Array.isArray(paragraph)) continue
-      const line = paragraph.map((el) => renderPostElement(el, mentions)).join('')
+      // Render elements sequentially, not with Promise.all: a paragraph with
+      // several inline images must download them one at a time, so a crafted
+      // post cannot open many concurrent transfers (the transport's timeout
+      // bounds the wait but does not cancel the underlying transfer).
+      const rendered: string[] = []
+      for (const el of paragraph) {
+        rendered.push(await renderPostElement(el, mentions, input, download, imageBudget))
+      }
+      const line = rendered.join('')
       if (line !== '') blocks.push(line)
     }
   }
@@ -170,7 +205,13 @@ function pickPostLocale(content: Record<string, unknown>): Record<string, unknow
 }
 
 /** Render one inline post element to Markdown. */
-function renderPostElement(el: unknown, mentions: Mention[]): string {
+async function renderPostElement(
+  el: unknown,
+  mentions: Mention[],
+  input: InboundContentInput,
+  download: InboundResourceDownloader,
+  imageBudget: ImageBudget,
+): Promise<string> {
   if (!isRecord(el)) return ''
   switch (el.tag) {
     case 'text':
@@ -185,7 +226,13 @@ function renderPostElement(el: unknown, mentions: Mention[]): string {
     case 'at':
       return renderPostAt(el, mentions)
     case 'img':
-      return '[image]'
+      // A post inline image carries its resource key in `image_key`.
+      return renderInlineImage(
+        typeof el.image_key === 'string' ? el.image_key : '',
+        input,
+        download,
+        imageBudget,
+      )
     default:
       return ''
   }
@@ -212,21 +259,34 @@ const MAX_CARD_NODES = 4000
 
 /**
  * Render a v2 interactive card to Markdown: the header title as bold, then each
- * text block. Card `markdown` / `lark_md` content is already Markdown, so it is
- * passed through unchanged; a card with no extractable text becomes `[card]`.
+ * text block and inline image. Card `markdown` / `lark_md` content is already
+ * Markdown, so it is passed through unchanged; inline images are downloaded to a
+ * local path (or a token-ref on failure); a card with no extractable content
+ * becomes `[card]`. The title is sanitized so a crafted card cannot break out of
+ * the bold span.
  */
-function renderCard(content: Record<string, unknown>): string {
+async function renderCard(
+  content: Record<string, unknown>,
+  input: InboundContentInput,
+  download: InboundResourceDownloader,
+  imageBudget: ImageBudget,
+): Promise<string> {
   const card = unwrapUserDsl(content)
   const parts: string[] = []
   const header = card.header
   if (isRecord(header) && isRecord(header.title)) {
     const title = header.title.content
-    if (typeof title === 'string' && title.trim() !== '') parts.push(`**${title}**`)
+    if (typeof title === 'string' && title.trim() !== '') {
+      const safe = safeInlineText(title)
+      if (safe) parts.push(`**${safe}**`)
+    }
   }
   const body = isRecord(card.body) ? card.body.elements : card.elements
   if (Array.isArray(body)) {
-    const budget = { nodes: MAX_CARD_NODES }
-    for (const el of body) collectCardText(el, parts, 0, budget)
+    const nodeBudget = { nodes: MAX_CARD_NODES }
+    for (const el of body) {
+      await collectCardText(el, parts, 0, nodeBudget, input, download, imageBudget)
+    }
   }
   return parts.length > 0 ? parts.join('\n\n') : '[card]'
 }
@@ -243,18 +303,25 @@ function unwrapUserDsl(card: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * Recursively collect readable text from a v2 card element into `parts`. Bounded
- * by `depth` (stack safety) and the shared `budget` (total work); past either it
- * stops descending rather than risk a stack overflow on a hostile card.
+ * Recursively collect readable content from a v2 card element into `parts`:
+ * text blocks, and inline images downloaded to a local path (or a token-ref on
+ * failure). Bounded by `depth` (stack safety) and `nodeBudget` (total parse
+ * work, every node and field and image included); inline-image downloads draw
+ * separately on the per-message `imageBudget` so a hostile card cannot fan out
+ * into many network fetches even within the node budget. Past depth or the node
+ * budget it stops descending rather than risk a stack overflow.
  */
-function collectCardText(
+async function collectCardText(
   el: unknown,
   parts: string[],
   depth: number,
-  budget: { nodes: number },
-): void {
-  if (depth > MAX_CARD_DEPTH || budget.nodes <= 0) return
-  budget.nodes--
+  nodeBudget: { nodes: number },
+  input: InboundContentInput,
+  download: InboundResourceDownloader,
+  imageBudget: ImageBudget,
+): Promise<void> {
+  if (depth > MAX_CARD_DEPTH || nodeBudget.nodes <= 0) return
+  nodeBudget.nodes--
   if (!isRecord(el)) return
   const tag = el.tag
   if (tag === 'markdown' || tag === 'plain_text' || tag === 'div') {
@@ -263,37 +330,49 @@ function collectCardText(
     const text = isRecord(el.text) ? el.text.content : el.content
     if (typeof text === 'string' && text.trim() !== '') parts.push(text)
     // div.fields[] — lark_md cells in field-layout cards from other bots. Each
-    // field consumes the shared budget too, so a div carrying thousands of
-    // fields cannot emit thousands of segments.
+    // field consumes the node budget too, so a div carrying thousands of fields
+    // cannot emit thousands of segments.
     if (Array.isArray(el.fields)) {
       for (const f of el.fields) {
-        if (budget.nodes <= 0) break
-        budget.nodes--
+        if (nodeBudget.nodes <= 0) break
+        nodeBudget.nodes--
         if (!isRecord(f)) continue
         const ft = isRecord(f.text) ? f.text.content : f.content
         if (typeof ft === 'string' && ft.trim() !== '') parts.push(ft)
       }
     }
   }
+  // A card inline image carries its resource key in `img_key` (note: not
+  // `image_key`, which posts use). The image node already consumed a node
+  // budget unit above; the download itself draws on the inline-image budget.
+  if (tag === 'img') {
+    const imgKey = typeof el.img_key === 'string' ? el.img_key : ''
+    parts.push(await renderInlineImage(imgKey, input, download, imageBudget))
+  }
   // column_set → columns[].elements[]
   if (Array.isArray(el.columns)) {
     for (const col of el.columns) {
       if (isRecord(col) && Array.isArray(col.elements)) {
-        for (const child of col.elements) collectCardText(child, parts, depth + 1, budget)
+        for (const child of col.elements) {
+          await collectCardText(child, parts, depth + 1, nodeBudget, input, download, imageBudget)
+        }
       }
     }
   }
   // Generic child elements (action blocks, nested containers).
   if (Array.isArray(el.elements)) {
-    for (const child of el.elements) collectCardText(child, parts, depth + 1, budget)
+    for (const child of el.elements) {
+      await collectCardText(child, parts, depth + 1, nodeBudget, input, download, imageBudget)
+    }
   }
 }
 
 // ── attachments ──────────────────────────────────────────────────────────────
 
 /**
- * Render a top-level image: download it and link the local path, or fall back
- * to a token-ref placeholder the model can resolve with lark-cli.
+ * Render a top-level image message. A message carries at most one top-level
+ * attachment, so this is not subject to the inline-image budget — it always
+ * attempts the single download.
  */
 async function renderImage(
   content: Record<string, unknown>,
@@ -301,12 +380,51 @@ async function renderImage(
   download: InboundResourceDownloader,
 ): Promise<string> {
   const imageKey = typeof content.image_key === 'string' ? content.image_key : ''
-  // No key means neither a download nor a token-ref is possible — only a bare
-  // placeholder.
+  return imageToMarkdown(imageKey, input, download)
+}
+
+/**
+ * Download one image by `imageKey` and link the local path, or fall back to a
+ * token-ref the model can resolve with lark-cli. A missing key leaves only a
+ * bare `[image]` placeholder — neither a download nor a token-ref is possible
+ * without it. The download goes through the same resource downloader as every
+ * other attachment, so the key is path-sanitized and the transfer bounded; a
+ * thrown download is treated as a failure.
+ */
+async function imageToMarkdown(
+  imageKey: string,
+  input: InboundContentInput,
+  download: InboundResourceDownloader,
+): Promise<string> {
   if (!imageKey) return '[image]'
-  const path = await safeDownload(download, { messageId: input.messageId, fileKey: imageKey, type: 'image' })
+  const path = await safeDownload(download, {
+    messageId: input.messageId,
+    fileKey: imageKey,
+    type: 'image',
+  })
   if (path) return `[image: ${path}]`
   return tokenRef('image', undefined, input.messageId, imageKey, 'image')
+}
+
+/**
+ * Render one inline image (post or card), gated by the per-message inline-image
+ * budget. Once the budget is exhausted, the image renders as a token-ref
+ * *without* a download, so a single message cannot fan out into more than
+ * `MAX_INLINE_IMAGE_DOWNLOADS` fetches. A download attempt — success or failure
+ * — consumes one budget unit, since the cost being bounded is the I/O attempt.
+ */
+async function renderInlineImage(
+  imageKey: string,
+  input: InboundContentInput,
+  download: InboundResourceDownloader,
+  imageBudget: ImageBudget,
+): Promise<string> {
+  if (!imageKey) return '[image]'
+  if (imageBudget.remaining <= 0) {
+    return tokenRef('image', undefined, input.messageId, imageKey, 'image')
+  }
+  imageBudget.remaining--
+  return imageToMarkdown(imageKey, input, download)
 }
 
 /**

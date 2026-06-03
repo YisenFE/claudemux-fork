@@ -98,7 +98,7 @@ describe('formatInboundContent — unreadable / malformed', () => {
 })
 
 describe('formatInboundContent — post (rich text)', () => {
-  test('renders title, paragraphs, link, mention, and inline image as Markdown', async () => {
+  test('renders title, paragraphs, link, mention, and a downloaded inline image', async () => {
     const post = {
       zh_cn: {
         title: 'Title',
@@ -110,15 +110,35 @@ describe('formatInboundContent — post (rich text)', () => {
           [
             { tag: 'at', user_name: 'Bob' },
             { tag: 'text', text: ' look' },
-            { tag: 'img', image_key: 'k' },
+            { tag: 'img', image_key: 'img_k' },
           ],
         ],
       },
     }
+    const dl = recorder('/tmp/feishu-inbound/om_test-img_k.png')
     // Inline elements are concatenated verbatim — each carries its own spacing,
     // so the trailing image abuts the preceding text just as Feishu sent it.
-    expect(await fmt('post', post)).toBe(
-      '**Title**\n\nhello [link](http://x)\n\n@Bob look[image]',
+    expect(await fmt('post', post, { download: dl.fn })).toBe(
+      '**Title**\n\nhello [link](http://x)\n\n@Bob look[image: /tmp/feishu-inbound/om_test-img_k.png]',
+    )
+    // The post inline image is downloaded by its image_key.
+    expect(dl.calls).toEqual([{ messageId: MSG_ID, fileKey: 'img_k', type: 'image' }])
+  })
+
+  test('a post inline image that fails to download falls back to a token-ref', async () => {
+    const post = { zh_cn: { content: [[{ tag: 'img', image_key: 'img_k' }]] } }
+    expect(await fmt('post', post, { download: recorder(null).fn })).toBe(
+      '[image — not downloaded; fetch via lark-cli, message_id=om_test, file_key=img_k, type=image]',
+    )
+  })
+
+  test('a post inline image whose download throws still degrades to a token-ref', async () => {
+    const post = { zh_cn: { content: [[{ tag: 'img', image_key: 'img_k' }]] } }
+    const throwing: InboundResourceDownloader = async () => {
+      throw new Error('boom')
+    }
+    expect(await fmt('post', post, { download: throwing })).toBe(
+      '[image — not downloaded; fetch via lark-cli, message_id=om_test, file_key=img_k, type=image]',
     )
   })
 
@@ -168,6 +188,92 @@ describe('formatInboundContent — interactive card', () => {
   test('a card with no extractable text becomes [card]', async () => {
     const c = card(undefined, [{ tag: 'hr' }, { tag: 'table' }])
     expect(await fmt('interactive', c)).toBe('[card]')
+  })
+
+  test('a card inline image is downloaded by its img_key and linked', async () => {
+    const c = card(undefined, [
+      { tag: 'markdown', content: 'see this' },
+      { tag: 'img', img_key: 'img_card_k' },
+    ])
+    const dl = recorder('/tmp/feishu-inbound/om_test-img_card_k.png')
+    expect(await fmt('interactive', c, { download: dl.fn })).toBe(
+      'see this\n\n[image: /tmp/feishu-inbound/om_test-img_card_k.png]',
+    )
+    // A card uses img_key, not image_key.
+    expect(dl.calls).toEqual([{ messageId: MSG_ID, fileKey: 'img_card_k', type: 'image' }])
+  })
+
+  test('a card inline image that fails to download falls back to a token-ref', async () => {
+    const c = card(undefined, [{ tag: 'img', img_key: 'img_card_k' }])
+    expect(await fmt('interactive', c, { download: recorder(null).fn })).toBe(
+      '[image — not downloaded; fetch via lark-cli, message_id=om_test, file_key=img_card_k, type=image]',
+    )
+  })
+
+  test('a card inline image inside a column_set is reached and downloaded', async () => {
+    const c = card(undefined, [
+      { tag: 'column_set', columns: [{ elements: [{ tag: 'img', img_key: 'nested_k' }] }] },
+    ])
+    const dl = recorder('/tmp/feishu-inbound/om_test-nested_k.png')
+    expect(await fmt('interactive', c, { download: dl.fn })).toBe(
+      '[image: /tmp/feishu-inbound/om_test-nested_k.png]',
+    )
+    expect(dl.calls).toHaveLength(1)
+  })
+})
+
+describe('formatInboundContent — inline image download bounds', () => {
+  test('several inline images in one paragraph download sequentially (max one in flight)', async () => {
+    let inFlight = 0
+    const state = { max: 0, calls: 0 }
+    const dl: InboundResourceDownloader = async (req) => {
+      state.calls++
+      inFlight++
+      state.max = Math.max(state.max, inFlight)
+      // Yield twice so a concurrent (Promise.all) caller would overlap here.
+      await Promise.resolve()
+      await Promise.resolve()
+      inFlight--
+      return `/tmp/feishu-inbound/${req.messageId}-${req.fileKey}.png`
+    }
+    const paragraph = Array.from({ length: 5 }, (_, i) => ({ tag: 'img', image_key: `k${i}` }))
+    const post = { zh_cn: { content: [paragraph] } }
+
+    await fmt('post', post, { download: dl })
+
+    expect(state.calls).toBe(5)
+    expect(state.max).toBe(1)
+  })
+
+  test('inline downloads are capped per message; the excess token-refs without downloading', async () => {
+    // 16 = MAX_INLINE_IMAGE_DOWNLOADS. Supply more inline images than the cap.
+    const calls: InboundResourceRequest[] = []
+    const dl: InboundResourceDownloader = async (req) => {
+      calls.push(req)
+      return `/tmp/feishu-inbound/${req.messageId}-${req.fileKey}.png`
+    }
+    const imgs = Array.from({ length: 20 }, (_, i) => ({ tag: 'img', img_key: `k${i}` }))
+    const out = await fmt('interactive', { body: { elements: imgs } }, { download: dl })
+
+    // The downloader is invoked at most the cap — never for the excess.
+    expect(calls.length).toBe(16)
+    // 16 downloaded paths + 4 token-refs = all 20 images still rendered.
+    expect((out.match(/\[image: /g) ?? []).length).toBe(16)
+    expect((out.match(/not downloaded/g) ?? []).length).toBe(4)
+  })
+
+  test('the inline budget is shared across post and card images within one message', async () => {
+    // A post paragraph of 20 inline images: only the cap downloads, regardless
+    // of where the images live.
+    const calls: InboundResourceRequest[] = []
+    const dl: InboundResourceDownloader = async (req) => {
+      calls.push(req)
+      return `/tmp/feishu-inbound/${req.messageId}-${req.fileKey}.png`
+    }
+    const paragraph = Array.from({ length: 20 }, (_, i) => ({ tag: 'img', image_key: `k${i}` }))
+    await fmt('post', { zh_cn: { content: [paragraph] } }, { download: dl })
+
+    expect(calls.length).toBe(16)
   })
 })
 
