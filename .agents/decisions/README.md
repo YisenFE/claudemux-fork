@@ -27,6 +27,7 @@ record kept for history — open it and follow its Status link to the current on
 - [send-supersede](/.agents/decisions/send-supersede.md) — a later `tm send` auto-supersedes an earlier in-flight send (only the latest waits)
 - [cross-process-cross-platform-invariants](/.agents/decisions/cross-process-cross-platform-invariants.md) — path-builder + cross-platform invariants (promoted into `CLAUDE.md`)
 - [hook-driven-busy-idle-signal](/.agents/decisions/hook-driven-busy-idle-signal.md) — BUSY/idle from hooks, not pane scraping
+- [dispatcher-sessionstart-recall](/.agents/decisions/dispatcher-sessionstart-recall.md) — recent `tm history` auto-injected at SessionStart, dispatcher-gated, via a plugin hook
 - [teammates-launch-without-askuserquestion](/.agents/decisions/teammates-launch-without-askuserquestion.md) — teammates launch with `AskUserQuestion` disabled
 - [worktree-default-and-name-repo-decoupling](/.agents/decisions/worktree-default-and-name-repo-decoupling.md) — worktree-by-default; teammate `name` decoupled from the repo path
 
@@ -69,6 +70,7 @@ never collide on a sequence number.
 | [codex-driver](/.agents/decisions/codex-driver.md) | Codex teammates ship as a `codex-` prefixed driver with a vendored protocol schema, FS-backed supervision, and an ask-mode borrow on the named pool | Accepted |
 | [codex-engine-flag](/.agents/decisions/codex-engine-flag.md) | The codex teammate kind moves from a `codex-` name prefix to an explicit `tm spawn --engine` flag, with one-minor deprecation | Superseded by [multi-engine-tui-architecture](/.agents/decisions/multi-engine-tui-architecture.md) |
 | [cross-process-cross-platform-invariants](/.agents/decisions/cross-process-cross-platform-invariants.md) | Three cross-process / cross-platform invariants were promoted into `CLAUDE.md` | Accepted |
+| [dispatcher-sessionstart-recall](/.agents/decisions/dispatcher-sessionstart-recall.md) | Recent `tm history` is auto-injected into the dispatcher at SessionStart (startup/resume/compact) via a plugin hook gated dispatcher-only, with relative `--since` durations so the hook needs no shell date math | Accepted |
 | [dispatcher-teammate-model](/.agents/decisions/dispatcher-teammate-model.md) | The foundational architecture — a dispatcher session orchestrating per-repo `tmux` `claude` teammates via `tm`, chosen over Agent Teams (no cwd pin, no per-repo memory); the dispatcher role grew from launcher to coordinator | Accepted |
 | [feishu-channel-bot-discovery](/.agents/decisions/feishu-channel-bot-discovery.md) | Peer bots' Open IDs are auto-discovered from messages + `/introduce`, surfaced via a one-shot baseline/delta and an MCP query tool; observing never widens the access gate | Accepted |
 | [feishu-channel-event-registry](/.agents/decisions/feishu-channel-event-registry.md) | The Feishu channel handles events through an extensible registry of per-event handlers | Accepted |
