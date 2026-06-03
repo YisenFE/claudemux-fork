@@ -78,6 +78,32 @@ fails too, since clearing an indicator on a guessed chat is the very misroute
 this design forbids. A plain reply requests no thread form, so the `230071`
 "group does not support reply in thread" error cannot arise.
 
+### thread_id is hidden from the model — a deliberate, revisitable choice
+
+The inbound `<channel>` tag does not carry `thread_id`, and the `reply` tool does
+not accept one. Answering inside a topic is achieved entirely through replying to
+the triggering message by its `message_id`: Feishu inherits that message's
+location (its topic, or the main timeline), so the model never names a topic.
+
+Rationale: it cuts the model's choice from three identifiers (`chat_id`,
+`message_id`, `thread_id`) down to two — "answer this message" or "post to this
+chat" — the same kind of decision it already makes between a p2p and a group
+reply. It also keeps a cross-chat misroute structurally impossible: whenever a
+`message_id` is in play, it and the `chat_id` come from the same inbound tag, so
+they cannot be a cross-conversation mismatch (see the reply-destinations decision
+above).
+
+Risk and when to revisit: hiding `thread_id` looks free today, but it forecloses
+a use case it cannot express — posting into a specific existing topic *without* a
+triggering message to answer (a bot-initiated post into a topic, rather than a
+reply to a message in it). If that need appears, `thread_id` can be reintroduced
+as an optional capability — likely alongside the larger forward feature, since
+the `forward` / `mergeForward` / `thread.forward` endpoints are the ones that
+accept `receive_id_type: thread_id` (plain `im.message.create` does not). That
+trade-off is deferred, not decided against: it would be evaluated on its own
+merits when a concrete need exists. Until then `thread_id` stays hidden to keep
+the model's surface minimal.
+
 ### Graceful shutdown is wired from the first commit
 
 A `ShutdownCoordinator` (`src/shutdown.ts`) handles SIGTERM/SIGINT and the
