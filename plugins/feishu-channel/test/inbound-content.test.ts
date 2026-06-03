@@ -222,6 +222,61 @@ describe('formatInboundContent — interactive card', () => {
   })
 })
 
+describe('formatInboundContent — inline image download bounds', () => {
+  test('several inline images in one paragraph download sequentially (max one in flight)', async () => {
+    let inFlight = 0
+    const state = { max: 0, calls: 0 }
+    const dl: InboundResourceDownloader = async (req) => {
+      state.calls++
+      inFlight++
+      state.max = Math.max(state.max, inFlight)
+      // Yield twice so a concurrent (Promise.all) caller would overlap here.
+      await Promise.resolve()
+      await Promise.resolve()
+      inFlight--
+      return `/tmp/feishu-inbound/${req.messageId}-${req.fileKey}.png`
+    }
+    const paragraph = Array.from({ length: 5 }, (_, i) => ({ tag: 'img', image_key: `k${i}` }))
+    const post = { zh_cn: { content: [paragraph] } }
+
+    await fmt('post', post, { download: dl })
+
+    expect(state.calls).toBe(5)
+    expect(state.max).toBe(1)
+  })
+
+  test('inline downloads are capped per message; the excess token-refs without downloading', async () => {
+    // 16 = MAX_INLINE_IMAGE_DOWNLOADS. Supply more inline images than the cap.
+    const calls: InboundResourceRequest[] = []
+    const dl: InboundResourceDownloader = async (req) => {
+      calls.push(req)
+      return `/tmp/feishu-inbound/${req.messageId}-${req.fileKey}.png`
+    }
+    const imgs = Array.from({ length: 20 }, (_, i) => ({ tag: 'img', img_key: `k${i}` }))
+    const out = await fmt('interactive', { body: { elements: imgs } }, { download: dl })
+
+    // The downloader is invoked at most the cap — never for the excess.
+    expect(calls.length).toBe(16)
+    // 16 downloaded paths + 4 token-refs = all 20 images still rendered.
+    expect((out.match(/\[image: /g) ?? []).length).toBe(16)
+    expect((out.match(/not downloaded/g) ?? []).length).toBe(4)
+  })
+
+  test('the inline budget is shared across post and card images within one message', async () => {
+    // A post paragraph of 20 inline images: only the cap downloads, regardless
+    // of where the images live.
+    const calls: InboundResourceRequest[] = []
+    const dl: InboundResourceDownloader = async (req) => {
+      calls.push(req)
+      return `/tmp/feishu-inbound/${req.messageId}-${req.fileKey}.png`
+    }
+    const paragraph = Array.from({ length: 20 }, (_, i) => ({ tag: 'img', image_key: `k${i}` }))
+    await fmt('post', { zh_cn: { content: [paragraph] } }, { download: dl })
+
+    expect(calls.length).toBe(16)
+  })
+})
+
 describe('formatInboundContent — top-level image', () => {
   test('a downloaded image links its local path', async () => {
     const dl = recorder('/tmp/feishu-inbound/om_test-img_v2_abc.png')
