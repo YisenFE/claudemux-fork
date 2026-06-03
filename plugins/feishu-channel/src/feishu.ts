@@ -84,6 +84,13 @@ export interface FeishuSendResult {
    * message_ids.
    */
   messageIds: string[]
+  /**
+   * The chat the message actually landed in. When the send replied to a
+   * message_id, this is the reply target's chat from the Feishu response — the
+   * authoritative landing chat, independent of any chat_id the caller paired
+   * with the message_id; otherwise it is the `chat_id` the send was routed to.
+   */
+  chatId: string
 }
 
 /**
@@ -94,6 +101,80 @@ export interface FeishuSendResult {
  */
 export function textMessageContent(text: string): string {
   return JSON.stringify({ text })
+}
+
+/**
+ * The Feishu business error code on an SDK result or a thrown error, or
+ * `undefined`. The lark SDK returns the raw `{ code, msg, data }` body for an
+ * HTTP-200 business error — so a non-zero `code` sits on the resolved value —
+ * and throws for an HTTP-level error, where the code, when present, is on the
+ * thrown axios error's `response.data`. This reads both shapes.
+ */
+function feishuErrorCode(x: unknown): number | undefined {
+  if (!x || typeof x !== 'object') return undefined
+  const top = (x as { code?: unknown }).code
+  if (typeof top === 'number') return top
+  const data = (x as { response?: { data?: { code?: unknown } } }).response?.data
+  if (data && typeof data.code === 'number') return data.code
+  return undefined
+}
+
+/** Build an Error from a non-zero Feishu response, carrying its `code`. */
+function feishuError(res: unknown): Error {
+  const code = feishuErrorCode(res)
+  const msg = (res as { msg?: unknown })?.msg
+  const detail = typeof msg === 'string' && msg ? `: ${msg}` : ''
+  return Object.assign(new Error(`Feishu API error ${code ?? '?'}${detail}`), { code })
+}
+
+/**
+ * Reply to `messageId`, returning the new message_id and the chat the reply
+ * landed in. Feishu inherits the replied message's location: a reply to a topic
+ * message lands back in that topic, a reply to a main-timeline message in the
+ * main timeline — no thread flag needed. The reply routes by `message_id`
+ * alone, so the returned `chatId` (from the reply response) is the authoritative
+ * landing chat — never a caller-supplied chat_id. A non-zero Feishu code throws
+ * (no silent drop), and a success that omits `chat_id` also throws rather than
+ * letting the caller guess the chat: clearing a received indicator must follow
+ * the real landing chat, not trusted input.
+ */
+async function replyToMessageOnce(
+  client: lark.Client,
+  messageId: string,
+  content: string,
+): Promise<{ messageId?: string; chatId: string }> {
+  const res = await client.im.message.reply({
+    path: { message_id: messageId },
+    data: { msg_type: 'interactive', content },
+  })
+  const code = feishuErrorCode(res)
+  if (code) throw feishuError(res)
+  const chatId = res.data?.chat_id
+  if (!chatId) {
+    throw new Error(
+      `Feishu reply to ${messageId} omitted chat_id; cannot resolve the landing chat`,
+    )
+  }
+  return { messageId: res.data?.message_id, chatId }
+}
+
+/**
+ * Create a message addressed by `chatId`, returning the new message_id. A
+ * non-zero Feishu code throws — same guard as the reply path — so a business
+ * failure never reads as a phantom "Sent" with nothing delivered.
+ */
+async function createMessageOnce(
+  client: lark.Client,
+  chatId: string,
+  content: string,
+): Promise<string | undefined> {
+  const res = await client.im.message.create({
+    params: { receive_id_type: 'chat_id' },
+    data: { receive_id: chatId, msg_type: 'interactive', content },
+  })
+  const code = feishuErrorCode(res)
+  if (code) throw feishuError(res)
+  return res.data?.message_id
 }
 
 /**
@@ -282,11 +363,22 @@ export interface FeishuTransport {
    */
   start(routes: InboundRoutes): Promise<void>
   /**
-   * Send a text message into a chat. Routed by `chat_id`, never by a
-   * message_id, so a forged reply target cannot redirect the message into an
-   * unrelated conversation.
+   * Send a text message into a chat. With `opts.replyToMessageId` set, it is
+   * sent as a reply to that message, which makes Feishu place it wherever that
+   * message lives — back in its topic if it was a topic message, or the main
+   * timeline otherwise — with no thread flag. The caller passes the message_id
+   * of the inbound message being answered, so the reply follows the very
+   * message that triggered it, and the result's `chatId` is the chat the reply
+   * landed in (from the Feishu response, never the caller's chat_id). Without
+   * `opts.replyToMessageId` the message is sent by `chat_id` as a standalone
+   * message (e.g. a proactive send with no message to answer). A non-zero Feishu
+   * code on either path throws rather than reporting a phantom success.
    */
-  sendText(chatId: string, text: string): Promise<FeishuSendResult>
+  sendText(
+    chatId: string,
+    text: string,
+    opts?: { replyToMessageId?: string },
+  ): Promise<FeishuSendResult>
   /**
    * Add an emoji reaction to a message and return the reaction_id Feishu
    * assigned. That id is what `removeReaction` needs to take the same reaction
@@ -567,28 +659,45 @@ export function createFeishuTransport(
       ;(standbyTimer as { unref?: () => void }).unref?.()
     },
 
-    async sendText(chatId: string, text: string): Promise<FeishuSendResult> {
+    async sendText(
+      chatId: string,
+      text: string,
+      opts?: { replyToMessageId?: string },
+    ): Promise<FeishuSendResult> {
       // Render the markdown source into one or more v2 cards. Routing per
       // block type — headings to `header.title`, tables to `tag: table`,
       // everything else to `tag: markdown` (lark_md) — keeps GFM tables and
-      // ATX headings from leaking through as literal `|` and `#`. A body
-      // too large for one card produces several cards, each sent as its own
-      // message_id so the recipient sees a threaded continuation.
+      // ATX headings from leaking through as literal `|` and `#`. A body too
+      // large for one card produces several cards, each its own message_id.
       const cards = renderMarkdownToCards(text)
       const messageIds: string[] = []
+      // The chat the message actually landed in. The whole send is either a
+      // reply (every card replies to the same message_id) or a create (every
+      // card to the same chat_id) — never a mix — so this resolves once per
+      // path. For a reply it comes only from the reply response, so a
+      // caller-supplied chat_id never participates; for a create it is the
+      // chat the create routed to.
+      let landedChatId: string | undefined
       for (const card of cards) {
-        const res = await client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'interactive',
-            content: cardToContent(card),
-          },
-        })
-        const id = res.data?.message_id
-        if (id) messageIds.push(id)
+        const content = cardToContent(card)
+        if (opts?.replyToMessageId) {
+          // Reply to the message: Feishu places it wherever that message lives
+          // (its topic, or the main timeline) — no thread flag, and the chat_id
+          // arg does not steer it. Every card replies to the same message so a
+          // split answer stays together.
+          const reply = await replyToMessageOnce(client, opts.replyToMessageId, content)
+          if (reply.messageId) messageIds.push(reply.messageId)
+          landedChatId = reply.chatId
+        } else {
+          const id = await createMessageOnce(client, chatId, content)
+          if (id) messageIds.push(id)
+          landedChatId = chatId
+        }
       }
-      return { messageIds }
+      // `?? chatId` only covers the degenerate empty-body case (no cards); a
+      // non-empty body always renders at least one card, so on the reply path
+      // landedChatId is the reply response's chat.
+      return { messageIds, chatId: landedChatId ?? chatId }
     },
 
     async addReaction(messageId: string, emoji: string): Promise<string> {

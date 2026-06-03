@@ -14,7 +14,7 @@ function fakeTransport(): FeishuTransport {
     appId: 'cli_fake',
     botOpenId: undefined,
     start: vi.fn(async () => {}),
-    sendText: vi.fn(async () => ({ messageIds: ['om_sent'] })),
+    sendText: vi.fn(async (chatId: string) => ({ messageIds: ['om_sent'], chatId })),
     addReaction: vi.fn(async () => 'rk_1'),
     removeReaction: vi.fn(async () => {}),
     editText: vi.fn(async () => {}),
@@ -195,7 +195,9 @@ describe('startDaemon (process body)', () => {
     })
     proxies.push(proxy)
     const result = await proxy.client.callTool('reply', { chat_id: 'oc_1', text: 'hi' })
-    expect(transport.sendText).toHaveBeenCalledWith('oc_1', 'hi')
+    // No topic anchor on a plain reply — the transport is called with an
+    // undefined replyToMessageId and routes by chat_id as before.
+    expect(transport.sendText).toHaveBeenCalledWith('oc_1', 'hi', { replyToMessageId: undefined })
     expect(result).toBeDefined()
   })
 

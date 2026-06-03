@@ -21,7 +21,7 @@ const transport: FeishuTransport = {
   appId: 'cli_test',
   botOpenId: undefined,
   start: async () => {},
-  sendText: async () => ({ messageIds: [] }),
+  sendText: async (chatId: string) => ({ messageIds: [], chatId }),
   addReaction: async () => '',
   removeReaction: async () => {},
   editText: async () => {},

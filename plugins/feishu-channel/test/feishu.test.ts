@@ -112,13 +112,14 @@ describe('commentFromBatchQuery', () => {
  */
 function stubClient() {
   const create = vi.fn(async () => ({ data: { message_id: 'om_stub' } }))
+  const reply = vi.fn(async () => ({ data: { message_id: 'om_reply', chat_id: 'oc_reply' } }))
   const patch = vi.fn(async () => ({}))
   const update = vi.fn(async () => ({}))
   const reactionCreate = vi.fn(async () => ({ data: { reaction_id: 'rk_stub' } }))
   const reactionDelete = vi.fn(async () => ({}))
   const stub = {
     im: {
-      message: { create, patch, update },
+      message: { create, reply, patch, update },
       messageReaction: { create: reactionCreate, delete: reactionDelete },
     },
     drive: {
@@ -130,6 +131,7 @@ function stubClient() {
   return {
     client: stub as unknown as lark.Client,
     create,
+    reply,
     patch,
     update,
     reactionCreate,
@@ -202,6 +204,125 @@ describe('createFeishuTransport — sendText', () => {
     expect(stub.create.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(result.messageIds[0]).toBe('om_a')
     expect(result.messageIds[1]).toBe('om_b')
+  })
+
+  test('replies via im.message.reply (no thread flag) and reports the landing chat', async () => {
+    const stub = stubClient()
+    const transport = buildTransport(stub)
+
+    const result = await transport.sendText('oc_chat', 'answering', {
+      replyToMessageId: 'om_anchor',
+    })
+
+    expect(result.messageIds).toEqual(['om_reply'])
+    // The landing chat comes from the reply response, not the chat_id arg —
+    // Feishu routes a reply by message_id into the message's own chat.
+    expect(result.chatId).toBe('oc_reply')
+    expect(stub.create).not.toHaveBeenCalled()
+    expect(stub.reply).toHaveBeenCalledTimes(1)
+    const calls = stub.reply.mock.calls as unknown as Array<
+      [{ path: { message_id: string }; data: { msg_type: string; content: string; reply_in_thread?: boolean } }]
+    >
+    const call = calls[0]?.[0]
+    expect(call).toBeDefined()
+    if (!call) return
+    expect(call.path.message_id).toBe('om_anchor')
+    expect(call.data.msg_type).toBe('interactive')
+    // No thread flag — Feishu inherits the replied message's topic on its own.
+    expect(call.data.reply_in_thread).toBeUndefined()
+  })
+
+  test('routes by chat_id (create) when no message_id is given', async () => {
+    const stub = stubClient()
+    const transport = buildTransport(stub)
+
+    const result = await transport.sendText('oc_chat', 'plain')
+
+    expect(stub.reply).not.toHaveBeenCalled()
+    expect(stub.create).toHaveBeenCalledTimes(1)
+    expect(result.chatId).toBe('oc_chat')
+  })
+
+  test('sends every card of a multi-card body as a reply to the same message', async () => {
+    const stub = stubClient()
+    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_a', chat_id: 'oc_reply' } } as never)
+    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_b', chat_id: 'oc_reply' } } as never)
+    const transport = buildTransport(stub)
+
+    const result = await transport.sendText('oc_chat', 'x'.repeat(60_000), {
+      replyToMessageId: 'om_anchor',
+    })
+
+    expect(stub.reply.mock.calls.length).toBeGreaterThanOrEqual(2)
+    const anchors = (
+      stub.reply.mock.calls as unknown as Array<[{ path: { message_id: string } }]>
+    ).map((c) => c[0].path.message_id)
+    expect(anchors.every((id) => id === 'om_anchor')).toBe(true)
+    expect(result.messageIds[0]).toBe('om_a')
+    expect(result.messageIds[1]).toBe('om_b')
+  })
+
+  test('throws on a 230071 reply code and never falls back to the caller chat_id', async () => {
+    // A plain reply (no reply_in_thread) cannot trigger 230071 ("group does not
+    // support reply in thread"); should it ever appear, it is treated like any
+    // other non-zero code — thrown, not degraded to an im.message.create on the
+    // caller-supplied chat_id (which could misroute and clear the wrong chat).
+    const stub = stubClient()
+    stub.reply.mockResolvedValueOnce({ code: 230071, msg: 'not support' } as never)
+    const transport = buildTransport(stub)
+
+    await expect(
+      transport.sendText('oc_chat', 'answering', { replyToMessageId: 'om_anchor' }),
+    ).rejects.toThrow()
+    expect(stub.create).not.toHaveBeenCalled()
+  })
+
+  test('re-throws a non-230071 reply error instead of masking it', async () => {
+    const stub = stubClient()
+    stub.reply.mockRejectedValueOnce(Object.assign(new Error('rate limited'), { code: 99991400 }))
+    const transport = buildTransport(stub)
+
+    await expect(
+      transport.sendText('oc_chat', 'in topic', { replyToMessageId: 'om_anchor' }),
+    ).rejects.toThrow('rate limited')
+    expect(stub.create).not.toHaveBeenCalled()
+  })
+
+  test('throws on a non-zero reply result code instead of silently dropping the message', async () => {
+    // The lark SDK returns the raw { code, msg } body for an HTTP-200 business
+    // error, so a non-zero code must be treated as a failure — not swallowed as
+    // a success that reports "Sent" while delivering nothing.
+    const stub = stubClient()
+    stub.reply.mockResolvedValueOnce({ code: 99991400, msg: 'rate limited' } as never)
+    const transport = buildTransport(stub)
+
+    await expect(
+      transport.sendText('oc_chat', 'answering', { replyToMessageId: 'om_anchor' }),
+    ).rejects.toThrow()
+    expect(stub.create).not.toHaveBeenCalled()
+  })
+
+  test('throws on a non-zero create result code instead of silently dropping the message', async () => {
+    // Same guard as the reply path, on the create (chat_id) path: a non-zero
+    // code is a failure, not a phantom Sent.
+    const stub = stubClient()
+    stub.create.mockResolvedValueOnce({ code: 99991400, msg: 'rate limited' } as never)
+    const transport = buildTransport(stub)
+
+    await expect(transport.sendText('oc_chat', 'proactive')).rejects.toThrow()
+  })
+
+  test('throws when a successful reply omits chat_id rather than trusting the caller chat_id', async () => {
+    // The landing chat must come from the reply response. If Feishu omits it we
+    // cannot safely clear a received indicator, and falling back to the caller's
+    // chat_id is exactly the misroute this design forbids — so fail instead.
+    const stub = stubClient()
+    stub.reply.mockResolvedValueOnce({ data: { message_id: 'om_reply' } } as never)
+    const transport = buildTransport(stub)
+
+    await expect(
+      transport.sendText('oc_chat', 'answering', { replyToMessageId: 'om_anchor' }),
+    ).rejects.toThrow(/chat_id/)
   })
 })
 

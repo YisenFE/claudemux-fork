@@ -15,7 +15,7 @@ import { renderMarkdownToCards } from '@excitedjs/feishu-transport'
 export class FakeTransport implements FeishuTransport {
   readonly appId: string
   botOpenId: string | undefined
-  readonly sent: { chatId: string; text: string }[] = []
+  readonly sent: { chatId: string; text: string; replyToMessageId?: string }[] = []
   readonly reactions: { messageId: string; emoji: string }[] = []
   readonly reactionRemovals: { messageId: string; reactionId: string }[] = []
   readonly edits: { messageId: string; text: string }[] = []
@@ -25,6 +25,12 @@ export class FakeTransport implements FeishuTransport {
   readonly metaFetches: { fileToken: string; fileType: string }[] = []
   /** When set, the named method throws — used to test outbound failure paths. */
   failOn: 'sendText' | 'addReaction' | 'removeReaction' | 'editText' | undefined
+  /**
+   * When set, a `sendText` carrying a `replyToMessageId` reports landing in this
+   * chat — simulating Feishu routing a reply by message_id into the replied
+   * message's own chat, regardless of the `chatId` the caller passed.
+   */
+  replyLandsInChatId: string | undefined
   /** Canned `fetchDocComment` result; `null` simulates a failed enrichment. */
   docComment: FeishuDocComment | null = null
   /** Canned `fetchDocMeta` result; `null` simulates a failed enrichment. */
@@ -37,16 +43,24 @@ export class FakeTransport implements FeishuTransport {
 
   async start(): Promise<void> {}
 
-  async sendText(chatId: string, text: string): Promise<FeishuSendResult> {
+  async sendText(
+    chatId: string,
+    text: string,
+    opts?: { replyToMessageId?: string },
+  ): Promise<FeishuSendResult> {
     if (this.failOn === 'sendText') throw new Error('feishu send failed')
-    this.sent.push({ chatId, text })
+    this.sent.push({ chatId, text, replyToMessageId: opts?.replyToMessageId })
     // The real transport renders the markdown into one or more cards and
     // returns one message_id per card sent. Mirror that here so a test that
     // exercises the "split across messages" summary path sees the same
     // messageIds.length the real transport would produce.
     const cards = renderMarkdownToCards(text)
     const messageIds = cards.map((_, i) => `om_sent_${i}`)
-    return { messageIds }
+    // A reply (replyToMessageId set) lands in the replied message's own chat;
+    // mirror that when the test configured it, else report the routed chat.
+    const landedChatId =
+      opts?.replyToMessageId && this.replyLandsInChatId ? this.replyLandsInChatId : chatId
+    return { messageIds, chatId: landedChatId }
   }
 
   /**
