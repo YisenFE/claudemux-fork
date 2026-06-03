@@ -209,6 +209,10 @@ Sources: forward tm history index, live/archived identity records, Claude
 transcripts, Codex rollouts. The index starts empty and never imports old
 Markdown ledgers.
 
+--since/--until accept either a relative duration — <N><unit> with unit m/h/d/w
+(minutes, hours, days, weeks), e.g. 30m, 12h, 3d, 1w, resolved as "<N> ago" —
+or an absolute date (2026-05-31, "2026-05-31 14:30:00", or ISO 8601).
+
 Time filters use the first in-file event timestamp; createdAtSource exposes
 mtime fallback. --name matches only indexed/live/last-killed attribution; for
 robust recovery prefer repo/id/time.

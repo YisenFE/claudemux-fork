@@ -22,7 +22,36 @@ function die(message: string): TmResult {
   return { code: 1, stdout: '', stderr: `tm: ${message}\n` }
 }
 
+const RELATIVE_DURATION_UNITS_MS: Readonly<Record<string, number>> = {
+  m: 60_000,
+  h: 60 * 60_000,
+  d: 24 * 60 * 60_000,
+  w: 7 * 24 * 60 * 60_000,
+}
+
+/**
+ * A relative-duration token is `<integer><unit>` with unit m/h/d/w
+ * (minutes, hours, days, weeks) — e.g. `30m`, `12h`, `3d`, `1w`. Returns the
+ * span in milliseconds, or null when the value is not a relative token (so
+ * the caller falls back to absolute date parsing). The grammar is exact:
+ * lowercase single-letter units only, no compound spans, no whitespace —
+ * anything else stays the absolute parser's responsibility.
+ */
+function parseRelativeDurationMs(value: string): number | null {
+  const match = /^(\d+)([mhdw])$/.exec(value)
+  if (match === null) return null
+  return Number(match[1]) * RELATIVE_DURATION_UNITS_MS[match[2]!]!
+}
+
 function parseTimeFlag(flag: string, value: string): number | TmResult {
+  // Relative durations resolve to "<duration> ago" — now minus the span — so
+  // a caller can ask for "the last 3 days" as `--since 3d` without computing
+  // an absolute date (and without the cross-platform `date` arithmetic a
+  // shell hook would otherwise need). Checked before absolute parsing; the
+  // grammar can't collide with any absolute date shape.
+  const relativeMs = parseRelativeDurationMs(value)
+  if (relativeMs !== null) return Date.now() - relativeMs
+
   const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(value)
     ? `${value.replace(' ', 'T')}Z`
     : value
