@@ -16,6 +16,7 @@
 import { writeFileSync } from 'node:fs'
 
 import { sendKeys } from './keys'
+import { claimSendToken, mintSendToken } from './supersede'
 import { confirmSubmit, probeStillAlive, waitForTurnEnd, waitPaneQuiet } from './wait-signals'
 import { echoCtxToStderr, printLastOrEmpty } from './post-turn'
 import { transcriptFile } from './ctx'
@@ -66,6 +67,23 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
   const sentResult = await sendKeys(name, prompt, env.runTmux, process.env)
   if (sentResult.code !== 0) return sentResult
 
+  // Claim this send's place in the teammate's send order — but ONLY now that
+  // the prompt has actually landed. A later `tm send` to the same teammate (a
+  // second steering prompt) then claims a fresh token; this send sees the
+  // token is no longer its own and returns early instead of waiting for a
+  // Stop the merged turn now settles under the later send. Claiming after
+  // delivery is load-bearing: a send that failed to deliver must not retire
+  // an earlier waiting send with a false "your result merges into mine"
+  // promise. `--pane-quiet` (hook-less TUI commands, not steering prompts)
+  // neither claims nor checks; a claim that fails to land yields a null token
+  // so this send simply waits as usual rather than mistaking the failure for
+  // a supersession.
+  let sendToken: string | null = null
+  if (!paneQuiet) {
+    const token = mintSendToken()
+    if (claimSendToken(name, token)) sendToken = token
+  }
+
   // Confirm the prompt was accepted as a turn (not swallowed by a modal).
   // Warn-and-proceed only — never converts a slow-but-live send into a
   // failure; the wait below still expires to 124 if the turn never runs.
@@ -79,8 +97,25 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
   const timeoutSec = timeout === null ? 1800 : Number(timeout)
   const verdict = paneQuiet
     ? await waitPaneQuiet(name, timeoutSec, env.runTmux)
-    : await waitForTurnEnd(name, timeoutSec, false, env.runTmux, anchor)
+    : await waitForTurnEnd(name, timeoutSec, false, env.runTmux, anchor, sendToken)
   if ('code' in verdict) return { ...verdict, stderr: confirmStderr + verdict.stderr }
+  if ('superseded' in verdict) {
+    // A newer `tm send` to this teammate arrived before this turn settled.
+    // The merged prompt is now owned by that later send's turn, so return
+    // early (exit 0 — the prompt WAS delivered, this is not a failure) and
+    // tell the agent where the combined reply will land.
+    return {
+      code: 0,
+      stdout: '',
+      stderr:
+        sentResult.stderr +
+        confirmStderr +
+        `tm send: ${name}: superseded by a newer send before this turn settled — ` +
+        `exiting early. This prompt was delivered and is queued into the teammate's ` +
+        `current run; its result merges into the later send's turn, so collect the ` +
+        `combined reply from that send (or 'tm wait ${name}'). exit 0.\n`,
+    }
+  }
   if (!verdict.ok) {
     // Re-probe at the timeout moment: a teammate that died mid-wait must
     // NOT be reported as "still running" with code 124, or the dispatcher's

@@ -36,6 +36,7 @@ rewrites it when the session_id rotates — without that, `tm states` /
 | `.cwd` | `cwd_file` | Physical cwd of the repo at spawn time | `tm spawn` | `on-session-start.sh` (the cwd-match identity gate) |
 | `.ready` | `ready_file` | Empty marker — REPL is up | `on-session-start.sh` | `tm spawn` (poll loop) |
 | `.send-at` | `send_at_file` | Empty; the *mtime* is the timestamp of the last send | `tm` (`_send_keys`) | `tm` (`_wait_pane_quiet`) |
+| `.send-token` | `sendTokenFile` | Latest `tm send`'s unique claim token (atomic temp-write + rename, last-claim-wins by identity); drives send auto-supersede (decision [send-supersede](/.agents/decisions/send-supersede.md)) | `tm` (`tm send`, Claude — after delivery) | `tm` (an in-flight `tm send`'s wait loop) |
 
 ### Sid-keyed — `/tmp/claude-idle/<sid>.*`
 
