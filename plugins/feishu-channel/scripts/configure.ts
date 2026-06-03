@@ -214,7 +214,7 @@ export const SCOPE_REMINDER = [
   '',
   'Reminder: this verified the credentials, not the app permission scopes —',
   'Feishu does not expose those to verify here. Make sure the app was granted',
-  'the message-resource read scope (im:resource-class) so the channel can',
+  'the message-resource read scope (im:resource) so the channel can',
   'download images and files from messages. Without it, attachments are still',
   'delivered, but as fetch-it-yourself placeholders instead of local file paths.',
   "The app's permission console lists each scope; see the channel README.",

@@ -14,6 +14,7 @@
  */
 
 import { isBotSenderType } from './access'
+import { safeIdentifier, safeInlineText } from './markdown-safe'
 import { getBotIdentity, recordBotIdentity } from './identity-store'
 import {
   clearPendingNewBots,
@@ -73,10 +74,17 @@ export interface DiscoveryContext {
   commit: () => void
 }
 
-/** Render one bot as ``**Name** (`open_id`)``, or just `` `open_id` `` when unnamed. */
+/**
+ * Render one bot as ``**Name** (`open_id`)``, or just `` `open_id` `` when
+ * unnamed. The display name and open_id are sanitized first: a bot name reaches
+ * us from another app's payload, so a name with newlines or Markdown delimiters
+ * must not break out of the bold span or the surrounding blockquote.
+ */
 function botRef(baseDir: string, appId: string, openId: string): string {
-  const name = getBotIdentity(baseDir, appId, openId)?.name
-  return name && name !== openId ? `**${name}** (\`${openId}\`)` : `\`${openId}\``
+  const id = safeIdentifier(openId)
+  const rawName = getBotIdentity(baseDir, appId, openId)?.name
+  const name = rawName ? safeInlineText(rawName) : ''
+  return name && rawName !== openId ? `**${name}** (\`${id}\`)` : `\`${id}\``
 }
 
 /**
@@ -102,11 +110,11 @@ export function buildDiscoveryContext(
     input.senderOpenId &&
     input.senderOpenId !== input.botOpenId
   ) {
-    const name = getBotIdentity(baseDir, appId, input.senderOpenId)?.name ?? input.senderName
+    const id = safeIdentifier(input.senderOpenId)
+    const rawName = getBotIdentity(baseDir, appId, input.senderOpenId)?.name ?? input.senderName
+    const name = rawName ? safeInlineText(rawName) : ''
     const ref =
-      name && name !== input.senderOpenId
-        ? `**${name}** (\`${input.senderOpenId}\`)`
-        : `\`${input.senderOpenId}\``
+      name && rawName !== input.senderOpenId ? `**${name}** (\`${id}\`)` : `\`${id}\``
     blocks.push(`> From bot ${ref}.`)
   }
 
@@ -150,10 +158,25 @@ export function buildDiscoveryContext(
   // Join the blocks with single newlines so the sender line and the baseline /
   // delta form one contiguous blockquote, then a blank line before the user's
   // own text — physically separating the system context from what they said.
+  // `ensureBlockquote` guarantees every line of that context begins with `> `,
+  // so the isolation holds even if a field ever slipped a newline past
+  // sanitization.
   return {
-    prefix: blocks.length > 0 ? blocks.join('\n') + '\n\n' : '',
+    prefix: blocks.length > 0 ? ensureBlockquote(blocks.join('\n')) + '\n\n' : '',
     commit: () => {
       for (const fn of commits) fn()
     },
   }
+}
+
+/**
+ * Guarantee every physical line of an assembled blockquote begins with the `> `
+ * marker, so the system context cannot leak a line that reads as the user's own
+ * text. Lines already marked are left untouched.
+ */
+function ensureBlockquote(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => (line.startsWith('>') ? line : `> ${line}`))
+    .join('\n')
 }

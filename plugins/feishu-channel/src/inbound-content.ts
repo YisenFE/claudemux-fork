@@ -20,6 +20,7 @@
 import { isRecord, mentionName } from '@excitedjs/feishu-transport'
 import type { Mention } from '@excitedjs/feishu-transport'
 import type { InboundResourceRequest } from './feishu'
+import { safeIdentifier, safeInlineText } from './markdown-safe'
 
 /** Downloads a top-level resource and yields its local path, or null on failure. */
 export type InboundResourceDownloader = (req: InboundResourceRequest) => Promise<string | null>
@@ -261,9 +262,13 @@ function collectCardText(
     // the nested-object form other bots use.
     const text = isRecord(el.text) ? el.text.content : el.content
     if (typeof text === 'string' && text.trim() !== '') parts.push(text)
-    // div.fields[] — lark_md cells in field-layout cards from other bots.
+    // div.fields[] — lark_md cells in field-layout cards from other bots. Each
+    // field consumes the shared budget too, so a div carrying thousands of
+    // fields cannot emit thousands of segments.
     if (Array.isArray(el.fields)) {
       for (const f of el.fields) {
+        if (budget.nodes <= 0) break
+        budget.nodes--
         if (!isRecord(f)) continue
         const ft = isRecord(f.text) ? f.text.content : f.content
         if (typeof ft === 'string' && ft.trim() !== '') parts.push(ft)
@@ -320,7 +325,7 @@ async function renderFile(
 ): Promise<string> {
   const fileKey = typeof content.file_key === 'string' ? content.file_key : ''
   const fileName = typeof content.file_name === 'string' ? content.file_name : ''
-  const display = safeDisplayName(fileName)
+  const display = safeInlineText(fileName)
   // No key means no download and no token-ref — only a bare placeholder.
   if (!fileKey) return display ? `[file: \`${display}\`]` : '[file]'
   if (fileName && isReadableFile(fileName)) {
@@ -361,36 +366,12 @@ function tokenRef(
   fileKey: string,
   type: 'image' | 'file',
 ): string {
-  const display = safeDisplayName(name ?? '')
+  const display = safeInlineText(name ?? '')
   const label = display ? `${kind}: \`${display}\` — not downloaded` : `${kind} — not downloaded`
   return (
     `[${label}; fetch via lark-cli, ` +
-    `message_id=${safeId(messageId)}, file_key=${safeId(fileKey)}, type=${type}]`
+    `message_id=${safeIdentifier(messageId)}, file_key=${safeIdentifier(fileKey)}, type=${type}]`
   )
-}
-
-/**
- * Reduce an externally-supplied file name to safe inline display text: drop
- * control characters and newlines (which would split the one-line placeholder),
- * and the backtick and square-bracket delimiters (which would break out of the
- * inline code or the surrounding `[...]`). Collapses whitespace and trims.
- */
-function safeDisplayName(name: string): string {
-  return name
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/[`[\]]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-/**
- * Reduce an identifier to the Feishu key charset for safe display in a
- * token-ref. A real message_id / file_key is already `[A-Za-z0-9_-]`, so this is
- * lossless for legitimate values and neutralizes a crafted key that tried to
- * inject `key=value` structure.
- */
-function safeId(value: string): string {
-  return value.replace(/[^A-Za-z0-9_-]/g, '_')
 }
 
 /**

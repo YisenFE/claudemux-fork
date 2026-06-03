@@ -278,6 +278,17 @@ describe('formatInboundContent — robustness (never throws)', () => {
     }
     expect(await fmt('interactive', card)).toBe('reachable')
   })
+
+  test('a div carrying thousands of fields is bounded by the node budget', async () => {
+    const fields = Array.from({ length: 5000 }, () => ({ text: { tag: 'lark_md', content: 'f' } }))
+    const card = { body: { elements: [{ tag: 'div', fields }] } }
+    const out = await fmt('interactive', card)
+    // Far fewer than the 5000 supplied fields render — the shared budget caps
+    // total work, so one div cannot emit thousands of segments.
+    const segments = out.split('\n\n')
+    expect(segments.length).toBeGreaterThan(0)
+    expect(segments.length).toBeLessThan(5000)
+  })
 })
 
 describe('formatInboundContent — file-name injection is neutralized', () => {

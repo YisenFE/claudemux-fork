@@ -14,8 +14,12 @@ import {
 import { readEnvFile } from '../src/server'
 
 describe('SCOPE_REMINDER', () => {
-  test('names the message-resource scope and is honest that it is unverified', () => {
+  test('names the real Feishu scope and is honest that it is unverified', () => {
     expect(SCOPE_REMINDER).toContain('message-resource')
+    // The exact Feishu scope name — not an invented "-class" suffix a user
+    // would search for and fail to find.
+    expect(SCOPE_REMINDER).toContain('im:resource')
+    expect(SCOPE_REMINDER).not.toContain('-class')
     expect(SCOPE_REMINDER).toMatch(/not.*scope|does not expose/i)
     // It is a warning, not a fatal verdict — attachments still degrade gracefully.
     expect(SCOPE_REMINDER).toContain('placeholder')
