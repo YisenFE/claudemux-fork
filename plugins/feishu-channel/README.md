@@ -39,9 +39,12 @@ Create a self-built app on the [Feishu Open Platform](https://open.feishu.cn)
      documents. See the note below before relying on this one.
 5. Grant the permission scopes the bot needs: reading incoming messages,
    sending messages as the bot, adding and removing message reactions (for the
-   `react` tool and the received indicator), and — for document comments —
-   reading document comments and document metadata. The app's permission
-   console lists each scope.
+   `react` tool and the received indicator), reading message resources (so the
+   channel can download images and files attached to messages into a local file
+   the session can open), and — for document comments — reading document
+   comments and document metadata. The app's permission console lists each
+   scope. Without the message-resource scope, attachments still arrive: each is
+   delivered as a placeholder you can fetch yourself instead of a local path.
 6. **Publish a release** of the app so the bot and its permissions take effect.
 7. From the app's credentials page, copy the **App ID** and **App Secret**.
 

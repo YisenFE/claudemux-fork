@@ -73,10 +73,10 @@ export interface DiscoveryContext {
   commit: () => void
 }
 
-/** Render one bot as a context line. */
-function botLine(baseDir: string, appId: string, openId: string): string {
-  const name = getBotIdentity(baseDir, appId, openId)?.name ?? openId
-  return `- name=${name}, open_id=${openId}`
+/** Render one bot as ``**Name** (`open_id`)``, or just `` `open_id` `` when unnamed. */
+function botRef(baseDir: string, appId: string, openId: string): string {
+  const name = getBotIdentity(baseDir, appId, openId)?.name
+  return name && name !== openId ? `**${name}** (\`${openId}\`)` : `\`${openId}\``
 }
 
 /**
@@ -96,14 +96,18 @@ export function buildDiscoveryContext(
   const blocks: string[] = []
   const commits: Array<() => void> = []
 
-  // Sender line — name + open_id of the peer bot that sent this message.
+  // Sender line — names the peer bot that sent this message.
   if (
     isBotSenderType(input.senderType) &&
     input.senderOpenId &&
     input.senderOpenId !== input.botOpenId
   ) {
-    const name = getBotIdentity(baseDir, appId, input.senderOpenId)?.name ?? input.senderName ?? input.senderOpenId
-    blocks.push(`【发送方 bot】name=${name}, open_id=${input.senderOpenId}`)
+    const name = getBotIdentity(baseDir, appId, input.senderOpenId)?.name ?? input.senderName
+    const ref =
+      name && name !== input.senderOpenId
+        ? `**${name}** (\`${input.senderOpenId}\`)`
+        : `\`${input.senderOpenId}\``
+    blocks.push(`> From bot ${ref}.`)
   }
 
   const state = readChatBots(baseDir, appId, chatId)
@@ -114,13 +118,14 @@ export function buildDiscoveryContext(
     const peers = state.openIds.filter(isPeer)
     if (peers.length > 0) {
       blocks.push(
-        `【本群 bot 基线】当前已知 ${peers.length} 个其它 bot：\n` +
-          peers.map((id) => botLine(baseDir, appId, id)).join('\n') +
-          `\n（被压缩后可用 feishu_list_chat_bots 工具再查）`,
+        `> Bots in this group (${peers.length}): ` +
+          peers.map((id) => botRef(baseDir, appId, id)).join(', ') +
+          '.\n> To @-mention one, pass its open_id to `reply`; run ' +
+          '`feishu_list_chat_bots` to re-list after compaction.',
       )
     } else {
       blocks.push(
-        '【本群 bot 基线】暂未发现其它 bot（no other bot yet）；之后它们发言或被 /introduce 后会自动补充。',
+        "> No other bots known in this group yet; they'll be added once they post or are introduced.",
       )
     }
     const pendingSnapshot = [...state.pendingNewBots]
@@ -134,15 +139,19 @@ export function buildDiscoveryContext(
     const pending = state.pendingNewBots.filter(isPeer)
     if (pending.length > 0) {
       blocks.push(
-        `【本群新增 bot】发现 ${pending.length} 个新 bot：\n` +
-          pending.map((id) => botLine(baseDir, appId, id)).join('\n'),
+        `> New bot${pending.length > 1 ? 's' : ''} in this group: ` +
+          pending.map((id) => botRef(baseDir, appId, id)).join(', ') +
+          '.',
       )
       commits.push(() => clearPendingNewBots(baseDir, appId, chatId, pending))
     }
   }
 
+  // Join the blocks with single newlines so the sender line and the baseline /
+  // delta form one contiguous blockquote, then a blank line before the user's
+  // own text — physically separating the system context from what they said.
   return {
-    prefix: blocks.length > 0 ? blocks.join('\n\n') + '\n\n' : '',
+    prefix: blocks.length > 0 ? blocks.join('\n') + '\n\n' : '',
     commit: () => {
       for (const fn of commits) fn()
     },

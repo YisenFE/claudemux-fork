@@ -212,6 +212,37 @@ describe('createImMessageHandler — delivery', () => {
     })
   })
 
+  test('a delivered image is downloaded and its local path is in the body', async () => {
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const transport = new FakeTransport()
+    transport.downloadResult = '/tmp/feishu-inbound/om_msg-img_v2_abc.png'
+    const handler = createImMessageHandler()
+
+    const delivery = await handler.handle(
+      rawEvent({ message_type: 'image', content: '{"image_key":"img_v2_abc"}' }),
+      makeCtx(transport),
+    )
+
+    expect(delivery?.content).toBe('[image: /tmp/feishu-inbound/om_msg-img_v2_abc.png]')
+    expect(transport.downloads).toEqual([
+      { messageId: 'om_msg', fileKey: 'img_v2_abc', type: 'image' },
+    ])
+  })
+
+  test('a dropped message never triggers an attachment download', async () => {
+    writeAccess({ dmPolicy: 'disabled' })
+    const transport = new FakeTransport()
+    const handler = createImMessageHandler()
+
+    const delivery = await handler.handle(
+      rawEvent({ message_type: 'image', content: '{"image_key":"img_v2_abc"}' }),
+      makeCtx(transport),
+    )
+
+    expect(delivery).toBeNull()
+    expect(transport.downloads).toHaveLength(0)
+  })
+
   test('delivers a group message when the bot is mentioned', async () => {
     writeAccess({ groups: { oc_group: { requireMention: true, allowFrom: [] } } })
     const handler = createImMessageHandler()
@@ -357,10 +388,10 @@ describe('createImMessageHandler — observed-bot delivery (follow-user policy)'
       makeCtx(transport),
     )
 
-    // The message body is delivered, now prefixed with a one-shot sender line
-    // naming the peer bot's open_id so the model can @-mention it back.
+    // The message body is delivered, now prefixed with a one-shot blockquote
+    // sender line naming the peer bot's open_id so the model can @-mention it back.
     expect(delivery?.content).toContain('hello from peer')
-    expect(delivery?.content).toContain('【发送方 bot】')
+    expect(delivery?.content).toContain('> From bot')
     expect(delivery?.content).toContain('ou_peer_bot')
     expect(delivery?.meta.sender_id).toBe('ou_peer_bot')
   })

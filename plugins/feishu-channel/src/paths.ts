@@ -68,3 +68,27 @@ export function botIdentityFile(base: string, appId: string): string {
 export function chatBotsFile(base: string, appId: string, chatId: string): string {
   return join(base, `feishu-chat-bots-${appId}-${chatId}.json`)
 }
+
+/**
+ * /tmp/feishu-inbound — the local cache for downloaded inbound message
+ * resources (top-level images and files). Fixed under /tmp, deliberately
+ * outside the channel state directory, so the OS reclaims it on its own (macOS
+ * clears untouched /tmp entries after a few days; Linux per its tmpfiles
+ * policy) and the channel writes no cleanup: a notification is asynchronous, so
+ * a downloaded file must outlive the gap between delivery and the model's Read.
+ * The absolute path is embedded verbatim in the delivered body for Read to open.
+ */
+export function inboundResourceDir(): string {
+  return join('/tmp', 'feishu-inbound')
+}
+
+/**
+ * Absolute on-disk path for one downloaded resource:
+ * `<inboundResourceDir>/<messageId>-<fileKey><ext>`. `messageId` (`om_...`) is
+ * unique per message and `fileKey` (`img_v2_...` / `file_v2_...`) per resource,
+ * and both contain only filename-safe characters, so the pair never collides.
+ * `ext` carries its own leading dot (or is empty when no extension is known).
+ */
+export function inboundResourcePath(messageId: string, fileKey: string, ext: string): string {
+  return join(inboundResourceDir(), `${messageId}-${fileKey}${ext}`)
+}

@@ -25,6 +25,7 @@ const transport: FeishuTransport = {
   addReaction: async () => '',
   removeReaction: async () => {},
   editText: async () => {},
+  downloadInboundResource: async () => null,
   fetchDocComment: async () => null,
   fetchDocMeta: async () => null,
   close: async () => {},

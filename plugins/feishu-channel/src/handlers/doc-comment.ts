@@ -126,40 +126,52 @@ export function normalizeCommentEvent(raw: unknown): FeishuCommentEvent | null {
   }
 }
 
-/** A human-readable summary of the comment, for the `<channel>` block body. */
+/**
+ * A structured Markdown summary of the comment, for the `<channel>` block body:
+ * a bold header naming the commenter (open_id as inline code) and the document
+ * (a Markdown link when its title and URL are known), the anchored selection as
+ * a blockquote, then the comment text.
+ */
 function describeComment(
   event: FeishuCommentEvent,
   comment: FeishuDocComment | null,
   docMeta: FeishuDocMeta | null,
 ): string {
-  const verb = event.replyId ? 'replied in a comment thread on' : 'commented on'
-  const lines = [`Feishu doc comment — ${event.commenterId} ${verb} ${describeDoc(event, docMeta)}:`, '']
+  const heading = event.replyId ? '**Doc comment reply**' : '**Doc comment**'
+  const lines = [`${heading} from \`${event.commenterId}\` on ${describeDoc(event, docMeta)}`, '']
 
-  // A local-selection comment is anchored to a quote; show what it points at.
+  // A local-selection comment is anchored to a quote; show what it points at as
+  // a blockquote, so the quoted text needs no quote characters of its own.
   if (comment && !comment.isWhole && comment.quote) {
-    lines.push(`On the selected text: “${comment.quote}”`, '')
+    lines.push(blockquote(comment.quote), '')
   }
 
   lines.push(commentBody(event, comment))
   return lines.join('\n')
 }
 
-/** Name the document a human would recognize: title and link, or the raw token. */
+/** Prefix every line of `text` with `> ` so a multi-line selection stays quoted. */
+function blockquote(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => `> ${line}`)
+    .join('\n')
+}
+
+/** Name the document a human would recognize: a Markdown link, or the raw token. */
 function describeDoc(event: FeishuCommentEvent, docMeta: FeishuDocMeta | null): string {
-  if (docMeta?.title && docMeta.url) return `“${docMeta.title}” (${docMeta.url})`
-  if (docMeta?.title) return `“${docMeta.title}”`
-  return `document ${event.fileToken} (${event.fileType})`
+  if (docMeta?.title && docMeta.url) return `[${docMeta.title}](${docMeta.url})`
+  if (docMeta?.title) return `**${docMeta.title}**`
+  return `document \`${event.fileToken}\` (${event.fileType})`
 }
 
 /** The text of the comment or reply the event is about, or a clear placeholder. */
 function commentBody(event: FeishuCommentEvent, comment: FeishuDocComment | null): string {
-  if (!comment) {
-    return '(comment text unavailable — the channel could not fetch it; read it on the document)'
-  }
+  if (!comment) return '[comment text unavailable]'
   const reply = pickReply(event, comment.replies)
-  if (!reply) return '(the comment carried no readable text)'
+  if (!reply) return '[no readable text]'
   const text = renderElements(reply.elements).trim()
-  return text || '(the comment carried no readable text)'
+  return text || '[no readable text]'
 }
 
 /**

@@ -18,6 +18,7 @@ function fakeTransport(): FeishuTransport {
     addReaction: vi.fn(async () => 'rk_1'),
     removeReaction: vi.fn(async () => {}),
     editText: vi.fn(async () => {}),
+    downloadInboundResource: vi.fn(async () => null),
     fetchDocComment: vi.fn(async () => null),
     fetchDocMeta: vi.fn(async () => null),
     close: vi.fn(async () => {}),

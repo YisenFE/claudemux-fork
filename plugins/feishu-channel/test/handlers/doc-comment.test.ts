@@ -156,9 +156,8 @@ describe('createDocCommentHandler — delivery', () => {
     const delivery = await createDocCommentHandler().handle(commentEvent(), makeCtx(transport))
 
     expect(delivery?.content).toContain('please take a look')
-    expect(delivery?.content).toContain('commented on')
-    expect(delivery?.content).toContain('Design Notes')
-    expect(delivery?.content).toContain('https://feishu.cn/docx/doccnAbC123')
+    expect(delivery?.content).toContain('**Doc comment** from')
+    expect(delivery?.content).toContain('[Design Notes](https://feishu.cn/docx/doccnAbC123)')
     expect(delivery?.meta).toEqual({
       kind: 'doc_comment',
       notice_type: 'add_comment',
@@ -198,17 +197,28 @@ describe('createDocCommentHandler — delivery', () => {
 
     expect(delivery?.meta.reply_id).toBe('rpl_9')
     expect(delivery?.meta.notice_type).toBe('add_reply')
-    expect(delivery?.content).toContain('replied in a comment thread')
+    expect(delivery?.content).toContain('**Doc comment reply**')
     expect(delivery?.content).toContain('the reply')
     expect(delivery?.content).not.toContain('first')
   })
 
-  test('shows the quoted selection for a local-selection comment', async () => {
+  test('shows the quoted selection as a blockquote, with no curly quotes', async () => {
     const transport = new FakeTransport()
     transport.docComment = docComment({ isWhole: false, quote: 'the latency paragraph' })
     const delivery = await createDocCommentHandler().handle(commentEvent(), makeCtx(transport))
 
-    expect(delivery?.content).toContain('the latency paragraph')
+    expect(delivery?.content).toContain('> the latency paragraph')
+    expect(delivery?.content).not.toContain('“')
+    expect(delivery?.content).not.toContain('”')
+  })
+
+  test('names the document by inline-code token when no title is fetched', async () => {
+    const transport = new FakeTransport()
+    transport.docComment = docComment()
+    // docMeta left null — the title/url fetch failed.
+    const delivery = await createDocCommentHandler().handle(commentEvent(), makeCtx(transport))
+
+    expect(delivery?.content).toContain('document `doccnAbC123` (docx)')
   })
 
   test('flattens rich content elements, including person mentions', async () => {

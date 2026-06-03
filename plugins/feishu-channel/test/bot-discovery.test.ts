@@ -107,6 +107,27 @@ describe('buildDiscoveryContext — sender line', () => {
     })
     expect(prefix).toBe('')
   })
+
+  test('renders the system context as a blockquote with the open_id in inline code', () => {
+    recordBotIdentity(dir, APP, CHAT, [{ openId: 'ou_b', name: 'BotB' }], 'introduce', NOW)
+    const { prefix } = buildDiscoveryContext(dir, APP, CHAT, {
+      botOpenId: SELF,
+      senderType: 'bot',
+      senderOpenId: 'ou_b',
+      now: NOW,
+    })
+    expect(prefix).toBe('> From bot **BotB** (`ou_b`).\n\n')
+  })
+
+  test('falls back to inline-code open_id when the bot name is unknown', () => {
+    const { prefix } = buildDiscoveryContext(dir, APP, CHAT, {
+      botOpenId: SELF,
+      senderType: 'bot',
+      senderOpenId: 'ou_b',
+      now: NOW,
+    })
+    expect(prefix).toBe('> From bot `ou_b`.\n\n')
+  })
 })
 
 describe('buildDiscoveryContext — baseline', () => {
