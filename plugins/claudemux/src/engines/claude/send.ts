@@ -100,10 +100,13 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
     : await waitForTurnEnd(name, timeoutSec, false, env.runTmux, anchor, sendToken)
   if ('code' in verdict) return { ...verdict, stderr: confirmStderr + verdict.stderr }
   if ('superseded' in verdict) {
-    // A newer `tm send` to this teammate arrived before this turn settled.
-    // The merged prompt is now owned by that later send's turn, so return
-    // early (exit 0 — the prompt WAS delivered, this is not a failure) and
-    // tell the agent where the combined reply will land.
+    // A newer `tm send` to this teammate arrived before this turn settled, so
+    // return early (exit 0 — the prompt WAS delivered, this is not a failure)
+    // and tell the agent where to collect the result. Whether the queued
+    // prompt is answered together with the later send or as a separate turn
+    // depends on the teammate's run, so the note points at `tm wait` /
+    // `tm last` rather than promising a single merged reply (see decision
+    // send-supersede, "Runtime behavior").
     return {
       code: 0,
       stdout: '',
@@ -112,8 +115,10 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
         confirmStderr +
         `tm send: ${name}: superseded by a newer send before this turn settled — ` +
         `exiting early. This prompt was delivered and is queued into the teammate's ` +
-        `current run; its result merges into the later send's turn, so collect the ` +
-        `combined reply from that send (or 'tm wait ${name}'). exit 0.\n`,
+        `current run; collect the result from the later send (or 'tm wait ${name}'). ` +
+        `It may be answered together with that send, or — on a pure-generation turn ` +
+        `with no mid-task pause — as a separate turn, so fall back to 'tm wait ` +
+        `${name}' / 'tm last ${name}' to read it. exit 0.\n`,
     }
   }
   if (!verdict.ok) {

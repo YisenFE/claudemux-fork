@@ -47,8 +47,10 @@ behavior from memory or this doc.
   A Claude `send` (and `spawn`/`resume --prompt`, which route through it)
   also **auto-supersedes**: if a newer `tm send` to the same teammate
   arrives while this one is still waiting, the earlier send returns early
-  (exit 0 + a note) and only the latest send waits for the merged reply —
-  see [decision send-supersede](/.agents/decisions/send-supersede.md).
+  (exit 0 + a note) and only the latest send keeps waiting for the result.
+  Whether the queued prompt merges into that turn or runs as a separate one
+  depends on the run — see
+  [decision send-supersede](/.agents/decisions/send-supersede.md).
 - **Read-only / fast verbs** — `ls`, `states`, `last`, `ctx`, `history`,
   `mem`, `doctor`, `kill`, `reload`. Sub-second; safe foreground. `history`
   defaults to bounded JSON and should be paged with `--limit` / `--cursor`
