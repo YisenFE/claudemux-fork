@@ -37,7 +37,9 @@ import { asString, isRecord } from '@excitedjs/feishu-transport'
 import { generatePairingCode } from '@excitedjs/feishu-transport'
 import { startDaemon } from './daemon'
 import type { DaemonLockRecord } from './daemon-lock'
-import { startProxy, type ProxyHandle } from './proxy'
+import { collectDiagnosis } from './doctor'
+import { defaultDoctorDeps } from './doctor-probes'
+import { installDoctorBootstrap, startProxy, startProxySession, type ProxyHandle } from './proxy'
 import {
   accessFile,
   daemonInboundQueueFile,
@@ -733,6 +735,7 @@ async function runDaemonMain(): Promise<void> {
     socketPath,
     daemonVersion: serverVersion(),
     generation: 1,
+    launchPath: pluginRoot(),
     self,
     transport,
     accessFile: accessFile(base),
@@ -760,15 +763,8 @@ async function runProxyMain(): Promise<void> {
   mkdirSync(base, { recursive: true })
   const socketPath = daemonSocketFile(base)
   const server = createMcpServer()
-  const proxy = await connectProxyOrSpawnDaemon({
-    socketPath,
-    mcpServer: server as unknown as ConnectProxyDeps['mcpServer'],
-    baseDir: base,
-  })
+  const runDoctor = proxyDoctorRunner(serverVersion(), stableProxySessionId(proxyRole()), base)
 
-  shutdown.register('feishu-proxy', () => {
-    proxy.close()
-  })
   shutdown.register('mcp-server', () => server.close())
   shutdown.watch(server)
   // Backstop for a parent that goes away without closing the MCP stdio.
@@ -776,7 +772,22 @@ async function runProxyMain(): Promise<void> {
   // dead session registered with the daemon until the socket eventually closes.
   shutdown.watchParent()
 
-  await server.connect(new StdioServerTransport())
+  // Expose the doctor + connect stdio first, then attach the daemon in the
+  // background (the normal delivery path, which may spawn a daemon). The doctor
+  // is reachable the instant stdio is up; an attach failure leaves it in place.
+  await startProxySession({
+    installBootstrap: () => installDoctorBootstrap(server as unknown as ConnectProxyDeps['mcpServer'], runDoctor),
+    connectStdio: () => server.connect(new StdioServerTransport()),
+    attach: () =>
+      connectProxyOrSpawnDaemon({
+        socketPath,
+        mcpServer: server as unknown as ConnectProxyDeps['mcpServer'],
+        baseDir: base,
+        runDoctorFn: runDoctor,
+      }),
+    onAttached: (proxy) => shutdown.register('feishu-proxy', () => proxy.close()),
+    onAttachError: (err) => defaultLogError('Feishu proxy failed to attach; doctor remains available', err),
+  })
 }
 
 interface ConnectProxyDeps {
@@ -788,6 +799,30 @@ interface ConnectProxyDeps {
   spawnDaemonProcessFn?: typeof spawnDaemonProcess
   sleepFn?: typeof sleep
   now?: () => number
+  /** Builds the local doctor runner for the proxy; injected for tests. */
+  runDoctorFn?: (verbose: boolean) => Promise<CallToolResult>
+}
+
+/**
+ * Build the proxy-local `feishu_channel_doctor` runner: gather the diagnosis
+ * read-only against this state dir and return it as a tool result. Spawns
+ * nothing and never forwards to the daemon.
+ */
+function proxyDoctorRunner(
+  version: string,
+  sessionId: string,
+  baseDir: string,
+): (verbose: boolean) => Promise<CallToolResult> {
+  return async (verbose: boolean) => {
+    const report = await collectDiagnosis(
+      defaultDoctorDeps({
+        runBy: { entry: 'proxy', version, sessionId },
+        verbose,
+        baseDir,
+      }),
+    )
+    return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] }
+  }
 }
 
 export async function connectProxyOrSpawnDaemon(deps: ConnectProxyDeps): Promise<ProxyHandle> {
@@ -797,6 +832,8 @@ export async function connectProxyOrSpawnDaemon(deps: ConnectProxyDeps): Promise
   const now = deps.now ?? Date.now
   const deadline = now() + DAEMON_STARTUP_TIMEOUT_MS
   const version = (deps.serverVersionFn ?? serverVersion)()
+  const runDoctor =
+    deps.runDoctorFn ?? proxyDoctorRunner(version, stableProxySessionId(proxyRole()), deps.baseDir)
   let spawned = false
   let sawOlderDaemon = false
   let lastError: unknown
@@ -813,6 +850,7 @@ export async function connectProxyOrSpawnDaemon(deps: ConnectProxyDeps): Promise
         metadata: deriveProxyMetadata(),
         onDaemonMissing: () => spawnDaemonProcessFn(deps.baseDir),
         mcpServer: deps.mcpServer,
+        runDoctor,
         logError: defaultLogError,
       })
       const daemon = proxy.connection.client.daemon
@@ -850,6 +888,7 @@ export async function connectProxyOrSpawnDaemon(deps: ConnectProxyDeps): Promise
       metadata: deriveProxyMetadata(),
       onDaemonMissing: () => spawnDaemonProcessFn(deps.baseDir),
       mcpServer: deps.mcpServer,
+      runDoctor,
       logError: defaultLogError,
     })
   }
@@ -953,25 +992,59 @@ export function deriveProxyMetadata(
 }
 
 /**
- * The one place feishu-channel reads a claudemux-specific env var. claudemux's
- * `tm spawn` injects `CLAUDEMUX_TEAMMATE_NAME` into the teammate's tmux session,
- * which the proxy inherits; the dispatcher session has none. Best-effort: when
- * absent (a non-claudemux session, or the dispatcher) it contributes nothing,
- * so it adds no runtime or version dependency on claudemux.
+ * The one place feishu-channel reads claudemux-specific env vars. claudemux's
+ * `tm spawn` injects these into the teammate's tmux session, which the proxy
+ * inherits; the dispatcher session has none. Best-effort: when absent (a
+ * non-claudemux session, or the dispatcher) each contributes nothing, so they
+ * add no runtime or version dependency on claudemux.
+ *
+ * - `CLAUDEMUX_TEAMMATE_NAME` → `teammate_name`, a readable session label.
+ * - `CLAUDEMUX_CHANNEL_TRANSPORT` → `transport`, the teammate's control-plane
+ *   transport (`stdio` | `broker`). feishu-channel cannot observe this itself —
+ *   its own MCP transport is always stdio, which is not the teammate's headless
+ *   transport — so the spawner that knows must declare it. `feishu_channel_doctor`
+ *   reads it to flag a broker owner that cannot receive channel inbound.
  */
 export function claudemuxIdentityFromEnv(
   env: Record<string, string | undefined>,
 ): Record<string, string> {
+  const out: Record<string, string> = {}
   const name = sessionToken(env.CLAUDEMUX_TEAMMATE_NAME)
-  return name === null ? {} : { teammate_name: name }
+  if (name !== null) out.teammate_name = name
+  const transport = env.CLAUDEMUX_CHANNEL_TRANSPORT
+  if (transport === 'stdio' || transport === 'broker') out.transport = transport
+  return out
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/** Process entry point: daemon mode or per-session proxy mode. */
+/**
+ * Process entry point for the standalone doctor: gather the diagnosis with no
+ * proxy registration and no daemon spawn, print it as JSON, and exit. This is
+ * the authoritative entry for the daemon-unreachable / stale-socket / stale-lock
+ * cases, since it touches nothing it must mutate. Diagnosis runs against the
+ * pinned install this CLI was launched from, independent of any session proxy.
+ */
+async function runDoctorMain(): Promise<void> {
+  const report = await collectDiagnosis(
+    defaultDoctorDeps({
+      runBy: { entry: 'cli', version: serverVersion() },
+      verbose: process.argv.includes('--verbose'),
+    }),
+  )
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
+  // A non-zero exit lets a wrapping script branch on a failed diagnosis.
+  if (report.summary.worst_severity === 'error') process.exitCode = 1
+}
+
+/** Process entry point: doctor, daemon, or per-session proxy mode. */
 async function main(): Promise<void> {
+  if (process.argv.includes('--doctor')) {
+    await runDoctorMain()
+    return
+  }
   if (process.argv.includes('--daemon') || process.env.FEISHU_CHANNEL_DAEMON === '1') {
     await runDaemonMain()
     return

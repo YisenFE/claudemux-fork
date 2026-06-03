@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 
 import { startDaemonServer, type DaemonServer } from '../src/daemon-server'
-import { startProxy, type ProxyHandle, type ProxyMcpServer } from '../src/proxy'
+import { installDoctorBootstrap, startProxy, startProxySession, type ProxyHandle, type ProxyMcpServer } from '../src/proxy'
 import {
   CHANNEL_TOOLS,
   channelNotification,
@@ -187,6 +187,11 @@ describe('thin proxy MCP wiring', () => {
 })
 
 describe('connectProxyOrSpawnDaemon', () => {
+  // Spawning a daemon when the socket is missing is the proxy's NORMAL delivery
+  // startup behavior (a session needs a daemon), not the doctor path: the doctor
+  // tool is handled locally and never reaches here. The no-spawn, no-disturbance
+  // diagnosis of a daemon-missing scene is the CLI `npm run doctor`, which does
+  // not register a proxy at all.
   test('spawns the daemon once, then retries the proxy connection until it succeeds', async () => {
     const mcp = fakeMcp()
     const handle = {
@@ -402,5 +407,150 @@ describe('deriveProxyMetadata', () => {
     expect(claudemuxIdentityFromEnv({ CLAUDEMUX_TEAMMATE_NAME: 'ok-name_1' })).toEqual({
       teammate_name: 'ok-name_1',
     })
+  })
+
+  test('reports a known channel transport, ignores an unknown one', () => {
+    expect(claudemuxIdentityFromEnv({ CLAUDEMUX_CHANNEL_TRANSPORT: 'broker' })).toEqual({ transport: 'broker' })
+    expect(claudemuxIdentityFromEnv({ CLAUDEMUX_CHANNEL_TRANSPORT: 'stdio' })).toEqual({ transport: 'stdio' })
+    expect(claudemuxIdentityFromEnv({ CLAUDEMUX_CHANNEL_TRANSPORT: 'http' })).toEqual({})
+    expect(
+      claudemuxIdentityFromEnv({ CLAUDEMUX_TEAMMATE_NAME: 'worker', CLAUDEMUX_CHANNEL_TRANSPORT: 'broker' }),
+    ).toEqual({ teammate_name: 'worker', transport: 'broker' })
+  })
+})
+
+describe('proxy-local doctor tool', () => {
+  let socketPath = ''
+  let daemon: DaemonServer | null = null
+  let proxy: ProxyHandle | null = null
+  let m = 0
+
+  beforeEach(() => {
+    socketPath = join(tmpdir(), `feishu-doctor-${process.pid}-${m++}.sock`)
+  })
+  afterEach(async () => {
+    proxy?.close()
+    await daemon?.close()
+    daemon = null
+    proxy = null
+  })
+
+  async function bootWithDoctor() {
+    const handleTool = vi.fn(async (name: string, args: Record<string, unknown>) => ({ tool: name, args }))
+    daemon = await startDaemonServer({ socketPath, daemonVersion: '0.2.1', generation: 1, core: { handleTool } })
+    const mcp = fakeMcp()
+    const runDoctor = vi.fn(async (verbose: boolean) => ({
+      content: [{ type: 'text' as const, text: JSON.stringify({ verbose }) }],
+    }))
+    proxy = await startProxy({
+      socketPath,
+      sessionId: 's1',
+      pid: 1,
+      proxyVersion: '0.2.1',
+      role: 'session',
+      mcpServer: mcp.server,
+      runDoctor,
+    })
+    return { mcp, handleTool, runDoctor }
+  }
+
+  test('advertises feishu_channel_doctor when a runner is provided', async () => {
+    const { mcp } = await bootWithDoctor()
+    const list = (await mcp.handlers.get(ListToolsRequestSchema)!({ params: { name: '' } })) as {
+      tools: Array<{ name: string }>
+    }
+    expect(list.tools.some((t) => t.name === 'feishu_channel_doctor')).toBe(true)
+  })
+
+  test('handles the doctor locally and never forwards it to the daemon', async () => {
+    const { mcp, handleTool, runDoctor } = await bootWithDoctor()
+    const result = await mcp.handlers.get(CallToolRequestSchema)!({
+      params: { name: 'feishu_channel_doctor', arguments: { verbose: true } },
+    })
+    expect(runDoctor).toHaveBeenCalledWith(true)
+    expect(handleTool).not.toHaveBeenCalled()
+    expect(result).toEqual({ content: [{ type: 'text', text: JSON.stringify({ verbose: true }) }] })
+  })
+})
+
+describe('installDoctorBootstrap — doctor reachable before/without a daemon', () => {
+  test('runs the doctor with no daemon connection and no spawn, and advertises it', async () => {
+    const mcp = fakeMcp()
+    const runDoctor = vi.fn(async (verbose: boolean) => ({
+      content: [{ type: 'text' as const, text: JSON.stringify({ verbose }) }],
+    }))
+    // No socket, no daemon, no connection manager — purely local.
+    installDoctorBootstrap(mcp.server, runDoctor)
+
+    const list = (await mcp.handlers.get(ListToolsRequestSchema)!({ params: { name: '' } })) as {
+      tools: Array<{ name: string }>
+    }
+    expect(list.tools.some((t) => t.name === 'feishu_channel_doctor')).toBe(true)
+
+    const doctorResult = await mcp.handlers.get(CallToolRequestSchema)!({
+      params: { name: 'feishu_channel_doctor', arguments: {} },
+    })
+    expect(runDoctor).toHaveBeenCalledWith(false)
+    expect(doctorResult).toEqual({ content: [{ type: 'text', text: JSON.stringify({ verbose: false }) }] })
+  })
+
+  test('a forwarded tool reports the daemon is still connecting', async () => {
+    const mcp = fakeMcp()
+    installDoctorBootstrap(mcp.server, async () => ({ content: [{ type: 'text', text: '{}' }] }))
+    const result = (await mcp.handlers.get(CallToolRequestSchema)!({
+      params: { name: 'reply', arguments: { chat_id: 'oc_1', text: 'hi' } },
+    })) as { isError?: boolean; content: Array<{ text: string }> }
+    expect(result.isError).toBe(true)
+    expect(result.content[0]?.text).toMatch(/connecting/i)
+  })
+})
+
+describe('startProxySession — the runProxyMain ordering contract', () => {
+  test('exposes the doctor (bootstrap + stdio) BEFORE the daemon attach, which runs in the background', async () => {
+    const order: string[] = []
+    let resolveAttach!: (h: ProxyHandle) => void
+    const attachPromise = new Promise<ProxyHandle>((r) => {
+      resolveAttach = r
+    })
+    const onAttached = vi.fn()
+
+    await startProxySession({
+      installBootstrap: () => order.push('bootstrap'),
+      connectStdio: async () => {
+        order.push('stdio')
+      },
+      attach: () => {
+        order.push('attach-started')
+        return attachPromise
+      },
+      onAttached,
+      onAttachError: vi.fn(),
+    })
+
+    // startProxySession resolves once stdio is up — it does NOT await the attach.
+    expect(order).toEqual(['bootstrap', 'stdio', 'attach-started'])
+    expect(onAttached).not.toHaveBeenCalled()
+
+    const handle = { close: vi.fn() } as unknown as ProxyHandle
+    resolveAttach(handle)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(onAttached).toHaveBeenCalledWith(handle)
+  })
+
+  test('a daemon attach failure does not fail the session — the doctor surface stays up', async () => {
+    const onAttachError = vi.fn()
+    await expect(
+      startProxySession({
+        installBootstrap: vi.fn(),
+        connectStdio: async () => {},
+        attach: () => Promise.reject(new Error('daemon missing')),
+        onAttached: vi.fn(),
+        onAttachError,
+      }),
+    ).resolves.toBeUndefined()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(onAttachError).toHaveBeenCalledWith(expect.any(Error))
   })
 })
