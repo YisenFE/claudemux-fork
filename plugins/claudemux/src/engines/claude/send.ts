@@ -16,7 +16,7 @@
 import { writeFileSync } from 'node:fs'
 
 import { sendKeys } from './keys'
-import { claimSendToken, mintSendToken } from './supersede'
+import { claimSendToken, mintSendToken, supersedeNote } from './supersede'
 import { confirmSubmit, probeStillAlive, waitForTurnEnd, waitPaneQuiet } from './wait-signals'
 import { echoCtxToStderr, printLastOrEmpty } from './post-turn'
 import { transcriptFile } from './ctx'
@@ -110,15 +110,7 @@ export async function claudeSend(args: readonly string[], env: ClaudeVerbEnv): P
     return {
       code: 0,
       stdout: '',
-      stderr:
-        sentResult.stderr +
-        confirmStderr +
-        `tm send: ${name}: superseded by a newer send before this turn settled — ` +
-        `exiting early. This prompt was delivered and is queued into the teammate's ` +
-        `current run; collect the result from the later send (or 'tm wait ${name}'). ` +
-        `It may be answered together with that send, or — on a pure-generation turn ` +
-        `with no mid-task pause — as a separate turn, so fall back to 'tm wait ` +
-        `${name}' / 'tm last ${name}' to read it. exit 0.\n`,
+      stderr: sentResult.stderr + confirmStderr + supersedeNote(name),
     }
   }
   if (!verdict.ok) {

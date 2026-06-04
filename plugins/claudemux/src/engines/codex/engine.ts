@@ -9,6 +9,7 @@
 
 import { Buffer } from 'node:buffer'
 import { existsSync } from 'node:fs'
+import { setTimeout as sleep } from 'node:timers/promises'
 
 import type { Engine } from '../engine'
 import type {
@@ -50,11 +51,19 @@ import type { ThreadListResponse } from '../../codex-protocol/v2/ThreadListRespo
 import type { ThreadReadResponse } from '../../codex-protocol/v2/ThreadReadResponse.js'
 import type { ThreadResumeResponse } from '../../codex-protocol/v2/ThreadResumeResponse.js'
 import type { ThreadStartResponse } from '../../codex-protocol/v2/ThreadStartResponse.js'
+import type { TurnStartResponse } from '../../codex-protocol/v2/TurnStartResponse.js'
 import type { ThreadTokenUsage } from '../../codex-protocol/v2/ThreadTokenUsage.js'
 import { EXIT_SYNC_WAIT_EXPIRED, type TmResult } from '../../tm'
 import type { CollectedTurn, TurnCompletedNotification } from './events.js'
 import { CodexWsClient } from './rpc.js'
-import { runTurn, subscribeTurnCollection } from './events.js'
+import { subscribeTurnCollection } from './events.js'
+import { nonSteerableTurnKind, readActiveTurnId, steerActiveTurn } from './steer.js'
+import {
+  claimSendToken,
+  isSuperseded,
+  mintSendToken,
+  supersedeNote,
+} from '../shared/send-token.js'
 import {
   CodexDaemonAlreadyAliveError,
   CodexDaemonSpawnInProgressError,
@@ -348,6 +357,179 @@ function isTimedOut<T>(value: T | { timedOut: true }): value is { timedOut: true
     value !== null &&
     (value as { timedOut?: unknown }).timedOut === true
   )
+}
+
+// ─── Send supersede ──────────────────────────────────────────────────────
+//
+// A `tm send` that arrives while a turn is already in flight steers its prompt
+// into that turn (`turn/steer`) and collects the merged result; the earlier
+// send exits early. The cross-process protocol mirrors the Claude engine's: a
+// single-use token in `/tmp/teammate-<name>.send-token` decides who survives.
+
+export const SUPERSEDED = Symbol('superseded')
+const SUPERSEDE_POLL_MS = 150
+const FIND_ACTIVE_TURN_RETRIES = 5
+const FIND_ACTIVE_TURN_DELAY_MS = 100
+
+/** Start the teammate's main thread (recording its id) or resume the existing one. */
+async function resolveSendThread(client: CodexWsClient, name: string): Promise<string> {
+  const existing = readDaemonState(name)?.threadId ?? null
+  if (existing !== null) {
+    await client.request<'thread/resume', ThreadResumeResponse>('thread/resume', {
+      threadId: existing,
+      persistExtendedHistory: false,
+    })
+    return existing
+  }
+  const resp = await client.request<'thread/start', ThreadStartResponse>('thread/start', {
+    experimentalRawEvents: false,
+    persistExtendedHistory: false,
+  })
+  writeThreadId(name, resp.thread.id)
+  return resp.thread.id
+}
+
+/**
+ * Race the turn's completion against this send being superseded. Resolves with
+ * the collected turn if it finishes first, or `SUPERSEDED` once a later send
+ * claims the teammate's send-token. The losing branch is abandoned: the daemon
+ * turn keeps running for the surviving send to collect, and the poll loop stops
+ * via the cancel flag so no timer leaks.
+ */
+export async function awaitTurnOrSupersede(
+  turn: Promise<CollectedTurn>,
+  name: string,
+  token: string,
+): Promise<CollectedTurn | typeof SUPERSEDED> {
+  let cancelled = false
+  const poll = new Promise<typeof SUPERSEDED>((resolve) => {
+    const tick = (): void => {
+      if (cancelled) return
+      if (isSuperseded(name, token)) {
+        resolve(SUPERSEDED)
+        return
+      }
+      setTimeout(tick, SUPERSEDE_POLL_MS)
+    }
+    setTimeout(tick, SUPERSEDE_POLL_MS)
+  })
+  try {
+    return await Promise.race([turn, poll])
+  } finally {
+    cancelled = true
+  }
+}
+
+/** The early-exit result a superseded send returns: exit 0 with the shared note. */
+function supersedeEarlyExit(name: string): TurnResult {
+  return {
+    kind: 'completed',
+    text: '',
+    items: [],
+    context: null,
+    tmResult: { code: 0, stdout: '', stderr: supersedeNote(name) },
+  }
+}
+
+/** Poll `thread/read` briefly for an in-progress turn, to ride out a holder mid-`turn/start`. */
+async function findActiveTurnWithRetry(
+  client: CodexWsClient,
+  threadId: string,
+): Promise<string | null> {
+  for (let attempt = 0; attempt < FIND_ACTIVE_TURN_RETRIES; attempt += 1) {
+    const id = await readActiveTurnId(client, threadId)
+    if (id !== null) return id
+    if (attempt < FIND_ACTIVE_TURN_RETRIES - 1) await sleep(FIND_ACTIVE_TURN_DELAY_MS)
+  }
+  return null
+}
+
+/**
+ * Steer this send's prompt into the active turn and collect the merged result.
+ * Claims `token` only after the steer lands (delivery), so a failed steer never
+ * falsely retires the earlier send. A `review`/`compact` turn cannot be steered
+ * — surface a recoverable failure pointing at a retry.
+ */
+async function collectSteeredTurn(
+  client: CodexWsClient,
+  req: SendRequest,
+  ctx: EngineContext,
+  threadId: string,
+  activeTurnId: string,
+  token: string,
+): Promise<TurnResult> {
+  // Subscribe before steering so a completion that fires right after the steer
+  // is never missed.
+  const collector = subscribeTurnCollection(client, threadId)
+  try {
+    await steerActiveTurn(client, {
+      threadId,
+      input: [{ type: 'text', text: req.prompt, text_elements: [] }],
+      expectedTurnId: activeTurnId,
+    })
+  } catch (e) {
+    const kind = nonSteerableTurnKind(e)
+    if (kind !== null) {
+      return {
+        kind: 'failed',
+        message:
+          `codex teammate '${req.name}' is busy — its current turn is a ${kind} ` +
+          `and cannot be steered; retry after it finishes`,
+        recoverable: true,
+      }
+    }
+    throw e
+  }
+  claimSendToken(req.name, token)
+  const outcome = await withTimeout(collector.awaitTurn(), req.timeoutMs)
+  if (isTimedOut(outcome)) return { kind: 'timed-out', elapsedMs: req.timeoutMs ?? 0 }
+  const rawPath = writeLastTurn(req.name, outcome.completed)
+  touchLastSeen(req.name)
+  return turnNotificationToResult(outcome.completed, {
+    name: req.name,
+    action: 'sent',
+    context: contextForCollectedTurn(outcome, ctx),
+    rawPath,
+  })
+}
+
+/**
+ * The busy path: a `tm send` that could not borrow the lock. It never holds the
+ * lock — it opens its own connection (like `tm wait`), finds the active turn on
+ * the main thread, steers into it, and collects. When the lock is held but the
+ * main thread has no steerable turn (e.g. a `tm ask` ephemeral turn holds the
+ * borrow), there is nothing to supersede — return an honest recoverable busy.
+ */
+async function supersedeBusySend(req: SendRequest, ctx: EngineContext): Promise<TurnResult> {
+  const threadId = readDaemonState(req.name)?.threadId ?? null
+  if (threadId === null) {
+    return {
+      kind: 'failed',
+      message: `codex teammate '${req.name}' is busy and has no started thread yet — retry shortly`,
+      recoverable: true,
+    }
+  }
+  let client: CodexWsClient | null = null
+  try {
+    client = await openInitializedCodexClient(req.name)
+    await client.request<'thread/resume', ThreadResumeResponse>('thread/resume', {
+      threadId,
+      persistExtendedHistory: false,
+    })
+    const activeTurnId = await findActiveTurnWithRetry(client, threadId)
+    if (activeTurnId === null) {
+      return { kind: 'failed', message: `codex teammate '${req.name}' is busy`, recoverable: true }
+    }
+    return await collectSteeredTurn(client, req, ctx, threadId, activeTurnId, mintSendToken())
+  } catch (e) {
+    return {
+      kind: 'failed',
+      message: `codex send on '${req.name}' failed: ${e instanceof Error ? e.message : String(e)}`,
+      recoverable: true,
+    }
+  } finally {
+    if (client !== null) client.close()
+  }
 }
 
 function closeClientWhenSettled(clientPromise: Promise<CodexWsClient>): void {
@@ -692,34 +874,45 @@ export class CodexEngine implements Engine {
     if (req.prompt.length === 0) {
       return { kind: 'failed', message: 'usage: tm send <teammate> "<prompt>"', recoverable: false }
     }
+
+    // A second `tm send` to a teammate whose turn is already in flight does not
+    // hard-fail: it supersedes the earlier send, exactly like the Claude engine.
+    // The O_EXCL borrow lock decides roles — the holder is the primary, a send
+    // that cannot borrow is the superseding steerer (it never holds the lock).
     if (!tryBorrowDaemon(req.name)) {
-      return { kind: 'failed', message: `codex teammate '${req.name}' is busy`, recoverable: true }
+      return supersedeBusySend(req, ctx)
     }
 
+    // ── Primary (lock holder) ──
+    // Claim a send token immediately, before delivering. A later send can only
+    // begin after it observes this held lock, and it claims only after its own
+    // steer lands — so this claim is guaranteed to precede the later one. When
+    // the later claim arrives, this send's `isSuperseded` check flips and it
+    // exits early (exit 0 + note) instead of collecting the merged turn.
+    const myToken = mintSendToken()
+    claimSendToken(req.name, myToken)
     let client: CodexWsClient | null = null
     try {
       client = await openInitializedCodexClient(req.name)
-      let threadId = readDaemonState(req.name)?.threadId ?? null
-      if (threadId === null) {
-        const resp = await client.request<'thread/start', ThreadStartResponse>('thread/start', {
-          experimentalRawEvents: false,
-          persistExtendedHistory: false,
-        })
-        threadId = resp.thread.id
-        writeThreadId(req.name, threadId)
-      } else {
-        await client.request<'thread/resume', ThreadResumeResponse>('thread/resume', {
-          threadId,
-          persistExtendedHistory: false,
-        })
+      const threadId = await resolveSendThread(client, req.name)
+      // If a turn is already running on the main thread — this send won a lock an
+      // earlier send freed when it exited on supersede — join that turn rather
+      // than start a colliding `turn/start`.
+      const existing = await readActiveTurnId(client, threadId)
+      if (existing !== null) {
+        return await collectSteeredTurn(client, req, ctx, threadId, existing, myToken)
       }
-
+      const collector = subscribeTurnCollection(client, threadId)
+      await client.request<'turn/start', TurnStartResponse>('turn/start', {
+        threadId,
+        input: [{ type: 'text', text: req.prompt, text_elements: [] }],
+      })
       const outcome = await withTimeout(
-        runTurn(client, threadId, req.prompt, { wait: true, cwd: null }),
+        awaitTurnOrSupersede(collector.awaitTurn(), req.name, myToken),
         req.timeoutMs,
       )
       if (isTimedOut(outcome)) return { kind: 'timed-out', elapsedMs: req.timeoutMs ?? 0 }
-      if (outcome === null) return { kind: 'no-op', reason: 'turn was started without waiting' }
+      if (outcome === SUPERSEDED) return supersedeEarlyExit(req.name)
       const rawPath = writeLastTurn(req.name, outcome.completed)
       touchLastSeen(req.name)
       return turnNotificationToResult(outcome.completed, {

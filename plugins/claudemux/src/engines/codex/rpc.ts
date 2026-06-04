@@ -80,6 +80,23 @@ export interface CodexWsClientOptions {
   url?: string
 }
 
+/**
+ * A rejected client request carries the daemon's structured error alongside
+ * the message. The envelope's `code`/`data` would otherwise be lost — some
+ * callers (e.g. supersede's `nonSteerableTurnKind`) want the structured
+ * `data` to classify the failure instead of only regexing the message.
+ */
+export class CodexRpcError extends Error {
+  readonly code: number | undefined
+  readonly data: unknown
+  constructor(message: string, code?: number, data?: unknown) {
+    super(message)
+    this.name = 'CodexRpcError'
+    this.code = code
+    this.data = data
+  }
+}
+
 export type NotificationHandler = (notif: ServerNotification) => void
 export type ServerRequestHandler = (req: ServerRequest) => Promise<unknown>
 export type CloseHandler = (reason: Error) => void
@@ -264,7 +281,7 @@ export class CodexWsClient {
     if (pending === undefined) return
     this.pending.delete(env.id)
     if ('error' in env) {
-      pending.reject(new Error(env.error.message))
+      pending.reject(new CodexRpcError(env.error.message, env.error.code, env.error.data))
     } else {
       pending.resolve(env.result)
     }

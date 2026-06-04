@@ -98,12 +98,24 @@ every ask leaks one server-side thread per call (a shelve-and-restore
 dance on the persisted `<dir>/thread` file does not free the
 daemon-side thread the call allocated).
 
-`tm send` does not currently acquire the lock; concurrent
-`tm send codex-N` + `tm ask` against the same teammate is guarded by codex's
-own per-thread sequencing — and since ask runs on a different
-(ephemeral) thread from send, there is no server-side contention even
-if the timing overlaps. A future PR can teach `send` to acquire the
-lock if user feedback shows that matters.
+`tm send` acquires the borrow lock for the duration of its turn, so a second
+`tm send` to the same teammate cannot start a colliding turn. Rather than
+hard-failing on the busy lock, the second send *supersedes* the first,
+mirroring the Claude engine: it opens its own connection (without the lock),
+steers its prompt into the in-flight turn (`turn/steer`), claims the teammate's
+send-token, and collects the merged result; the first send sees the new token
+and exits early (exit 0) with the shared supersede note. A single-use token in
+`/tmp/teammate-<name>.send-token` ([`engines/shared/send-token.ts`](/plugins/claudemux/src/engines/shared/send-token.ts))
+decides who survives — last claim wins, by identity, claimed only after the
+steer delivers. The shared turn-control helpers live in
+[`engines/codex/steer.ts`](/plugins/claudemux/src/engines/codex/steer.ts).
+
+Two busy cases do not supersede: when the lock is held but the teammate's main
+thread has no in-progress turn — e.g. a `tm ask` ephemeral turn holds the
+borrow — there is nothing to steer, so the send returns a recoverable "busy"
+rather than touching the ask's ephemeral thread; and a `review` or `compact`
+turn cannot be steered (the daemon's `activeTurnNotSteerable` error), so the
+send reports a recoverable busy pointing at a retry.
 
 ### 4. Doctor reaps dead-pid orphans, never live ones
 
