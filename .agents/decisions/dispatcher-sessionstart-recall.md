@@ -32,8 +32,11 @@ Two supporting choices make it robust:
   plugin update — and a SessionStart hook failure shows its stderr to the user
   on *every* session start, so a stale path spams an error each launch. The
   plugin's `hooks.json` instead uses `${CLAUDE_PLUGIN_ROOT}`, re-resolved to
-  the current version every launch, and the script calls bare `tm` (Claude
-  Code prepends each plugin's `bin/` to PATH) — both version-stable. The hook
+  the current version every launch. The script resolves `tm` the same way —
+  `${CLAUDE_PLUGIN_ROOT}/bin/tm` first, falling back to `tm` on PATH — so it
+  stays version-coherent and keeps resolving even when a mid-session plugin
+  reload drops the plugin's `bin/` off PATH (a PATH-only lookup would silently
+  inject nothing there). The hook
   gates three ways: `TM_DISPATCHER_DIR` set, `CLAUDEMUX_TEAMMATE_NAME` unset,
   and — the authoritative check — the SessionStart `cwd` realpath-equal to
   `TM_DISPATCHER_DIR`. The cwd check is what actually pins it to the
@@ -66,7 +69,9 @@ Two supporting choices make it robust:
   [`test/cli/on_session_start_recall.bats`](/plugins/claudemux/test/cli/on_session_start_recall.bats)
   covers all three gates (including a cwd that differs from `TM_DISPATCHER_DIR`
   by a symlink but resolves equal — which must still inject — and the reverse),
-  the size-cap truncation, the `additionalContext` JSON shape, and the
+  the size-cap truncation, the `additionalContext` JSON shape, the
+  `tm`-resolution order (`${CLAUDE_PLUGIN_ROOT}/bin/tm` preferred over PATH,
+  PATH fallback, and injection surviving a stale PATH), and the
   `tm history`-failure degradation;
   [`test/verbs/history-time-flags.test.ts`](/plugins/claudemux/test/verbs/history-time-flags.test.ts)
   covers the relative/absolute/invalid `--since` grammar.

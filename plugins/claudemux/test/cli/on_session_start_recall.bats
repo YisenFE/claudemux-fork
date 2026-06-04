@@ -16,6 +16,10 @@ setup() {
   BIN="$WORK/bin"
   DISP="$WORK/dispatcher"
   mkdir -p "$BIN" "$DISP"
+  # `tm` resolution prefers ${CLAUDE_PLUGIN_ROOT}/bin/tm over PATH. Unset it so
+  # the PATH-based fake-tm tests stay deterministic regardless of the runner's
+  # environment; the plugin-root tests set it explicitly.
+  unset CLAUDE_PLUGIN_ROOT
 }
 
 teardown() {
@@ -43,6 +47,33 @@ write_fake_tm() {
 write_failing_tm() {
   printf '#!/usr/bin/env bash\necho "tm boom" >&2\nexit %s\n' "$1" > "$BIN/tm"
   chmod +x "$BIN/tm"
+}
+
+# Write a fake `tm` at $1/bin/tm (a stand-in CLAUDE_PLUGIN_ROOT layout) that
+# prints the remaining args, one per line, and exits 0.
+write_root_tm() {
+  local root="$1"; shift
+  mkdir -p "$root/bin"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf "%%s\\n"'
+    local line
+    for line in "$@"; do printf ' %q' "$line"; done
+    printf '\n'
+  } > "$root/bin/tm"
+  chmod +x "$root/bin/tm"
+}
+
+# Build a PATH directory carrying the hook's helper tools (so gate 3 and the jq
+# guard still work) but deliberately NOT tm — the stale-PATH shape after a
+# plugin reload drops the plugin's bin/ off PATH. Prints the directory.
+tools_without_tm() {
+  local d="$WORK/tools" t p
+  mkdir -p "$d"
+  for t in env bash cat sed head jq; do
+    p="$(command -v "$t" 2>/dev/null)" && [ -n "$p" ] && ln -sf "$p" "$d/$t"
+  done
+  printf '%s' "$d"
 }
 
 # Run the hook as a dispatcher session: both env gates satisfied and the
@@ -139,10 +170,51 @@ run_recall() {
   [ -z "$output" ]
 }
 
-@test "recall: no-op when tm is not on PATH" {
-  # A PATH that can find bash + the stdin-parse tools (cat/sed/head) but not tm.
+@test "recall: no-op when tm resolves via neither \${CLAUDE_PLUGIN_ROOT} nor PATH" {
+  # CLAUDE_PLUGIN_ROOT is unset (setup) and PATH can find bash + the stdin-parse
+  # tools (cat/sed/head) but not tm → both resolution paths miss → silent no-op.
   run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$DISP" \
     PATH="/usr/bin:/bin" bash "$HOOK" <<<"$(payload "$DISP")"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+@test "recall: prefers \${CLAUDE_PLUGIN_ROOT}/bin/tm over a tm on PATH" {
+  # The plugin-root path is the version-coherent resolution; it must win over a
+  # tm reachable through PATH.
+  local root="$WORK/plugin"
+  write_root_tm "$root" "id9 codex idle repoR t9 from plugin-root tm"
+  write_fake_tm "id1 codex idle repoA t1 from PATH tm"
+  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$DISP" \
+    CLAUDE_PLUGIN_ROOT="$root" PATH="$BIN:$PATH" bash "$HOOK" <<<"$(payload "$DISP")"
+  [ "$status" -eq 0 ]
+  ctx="$(echo "$output" | jq -r '.hookSpecificOutput.additionalContext')"
+  echo "$ctx" | grep -q "from plugin-root tm"
+  ! echo "$ctx" | grep -q "from PATH tm"
+}
+
+@test "recall: resolves tm via \${CLAUDE_PLUGIN_ROOT}/bin/tm when tm is off PATH" {
+  # The drift this guards: after a plugin version change reloads plugins, tm can
+  # drop off PATH. The absolute plugin-root path still resolves, so the hook
+  # keeps injecting instead of silently degrading to a no-op.
+  local root="$WORK/plugin"
+  write_root_tm "$root" "id9 codex idle repoR t9 survived stale PATH"
+  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$DISP" \
+    CLAUDE_PLUGIN_ROOT="$root" PATH="$(tools_without_tm)" \
+    bash "$HOOK" <<<"$(payload "$DISP")"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.hookSpecificOutput.hookEventName == "SessionStart"' >/dev/null
+  echo "$output" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "survived stale PATH"
+}
+
+@test "recall: falls back to PATH tm when \${CLAUDE_PLUGIN_ROOT}/bin/tm is not executable" {
+  # CLAUDE_PLUGIN_ROOT is set but carries no usable bin/tm → the -x guard fails
+  # and resolution falls back to PATH.
+  local root="$WORK/empty-plugin"
+  mkdir -p "$root/bin"
+  write_fake_tm "id1 codex idle repoA t1 from PATH fallback"
+  run env -u CLAUDEMUX_TEAMMATE_NAME TM_DISPATCHER_DIR="$DISP" \
+    CLAUDE_PLUGIN_ROOT="$root" PATH="$BIN:$PATH" bash "$HOOK" <<<"$(payload "$DISP")"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "from PATH fallback"
 }
