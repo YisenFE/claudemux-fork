@@ -12,7 +12,7 @@
 import type { AddressInfo } from 'node:net'
 import { rmSync } from 'node:fs'
 
-import { afterEach, beforeEach, describe, expect, test } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { WebSocketServer } from '#ws'
 import type { WebSocket as WsServerSocket } from '#ws'
 
@@ -24,7 +24,7 @@ import {
   readActiveTurnId,
   steerActiveTurn,
 } from '../../../src/engines/codex/steer'
-import { SUPERSEDED, awaitTurnOrSupersede } from '../../../src/engines/codex/engine'
+import { SUPERSEDED, TIMED_OUT, awaitTurnOrSupersede } from '../../../src/engines/codex/engine'
 import { claimSendToken, mintSendToken } from '../../../src/engines/shared/send-token'
 import { sendTokenFile } from '../../../src/persistence/paths'
 import type { Thread } from '../../../src/codex-protocol/v2/Thread'
@@ -212,7 +212,7 @@ describe('awaitTurnOrSupersede', () => {
     const myToken = mintSendToken()
     claimSendToken(name, myToken)
     const turn = fakeTurn()
-    const result = await awaitTurnOrSupersede(Promise.resolve(turn), name, myToken)
+    const result = await awaitTurnOrSupersede(Promise.resolve(turn), name, myToken, null)
     expect(result).toBe(turn)
   })
 
@@ -221,9 +221,38 @@ describe('awaitTurnOrSupersede', () => {
     claimSendToken(name, myToken)
     // A turn that never settles on its own — only supersession ends the wait.
     const pending = new Promise<CollectedTurn>(() => {})
-    const race = awaitTurnOrSupersede(pending, name, myToken)
+    const race = awaitTurnOrSupersede(pending, name, myToken, null)
     // A later send claims a fresh token.
     claimSendToken(name, mintSendToken())
     expect(await race).toBe(SUPERSEDED)
+  })
+
+  test('resolves with TIMED_OUT and clears the supersede poll timer (no leak)', async () => {
+    vi.useFakeTimers()
+    try {
+      const myToken = mintSendToken()
+      claimSendToken(name, myToken)
+      // Neither the turn nor a supersession ever arrives — only the timeout ends it.
+      const pending = new Promise<CollectedTurn>(() => {})
+      const race = awaitTurnOrSupersede(pending, name, myToken, 30)
+      await vi.advanceTimersByTimeAsync(50)
+      expect(await race).toBe(TIMED_OUT)
+      // The recursive poll timer must be cleared in `finally`, not left
+      // rescheduling forever (which would keep the process alive past --timeout).
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('with a null token, never reports SUPERSEDED even as tokens churn', async () => {
+    const myToken = mintSendToken()
+    claimSendToken(name, myToken)
+    const turn = fakeTurn()
+    // A claim that "failed to land" → null token → no supersede poll; a churning
+    // token must not flip it to SUPERSEDED, only the turn (or timeout) ends it.
+    claimSendToken(name, mintSendToken())
+    const result = await awaitTurnOrSupersede(Promise.resolve(turn), name, null, 1000)
+    expect(result).toBe(turn)
   })
 })

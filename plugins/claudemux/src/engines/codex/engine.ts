@@ -367,6 +367,7 @@ function isTimedOut<T>(value: T | { timedOut: true }): value is { timedOut: true
 // single-use token in `/tmp/teammate-<name>.send-token` decides who survives.
 
 export const SUPERSEDED = Symbol('superseded')
+export const TIMED_OUT = Symbol('timed-out')
 const SUPERSEDE_POLL_MS = 150
 const FIND_ACTIVE_TURN_RETRIES = 5
 const FIND_ACTIVE_TURN_DELAY_MS = 100
@@ -390,33 +391,56 @@ async function resolveSendThread(client: CodexWsClient, name: string): Promise<s
 }
 
 /**
- * Race the turn's completion against this send being superseded. Resolves with
- * the collected turn if it finishes first, or `SUPERSEDED` once a later send
- * claims the teammate's send-token. The losing branch is abandoned: the daemon
- * turn keeps running for the surviving send to collect, and the poll loop stops
- * via the cancel flag so no timer leaks.
+ * Race the turn's completion against this send being superseded and against the
+ * wall-clock timeout. Resolves with the collected turn, or `SUPERSEDED` once a
+ * later send claims the teammate's send-token, or `TIMED_OUT` at `timeoutMs`.
+ *
+ * The timeout is folded in here (rather than wrapped by `withTimeout`) so that
+ * whichever branch wins, the `finally` always runs and clears BOTH the poll and
+ * timeout timers — a `withTimeout` wrapper would settle on timeout while this
+ * function's own race stayed pending, leaking the recursive poll timer and
+ * keeping the process alive. `token === null` (a claim that never landed) skips
+ * the supersede poll: such a send simply waits rather than mistaking the missing
+ * claim for a newer send.
  */
 export async function awaitTurnOrSupersede(
   turn: Promise<CollectedTurn>,
   name: string,
-  token: string,
-): Promise<CollectedTurn | typeof SUPERSEDED> {
+  token: string | null,
+  timeoutMs: number | null,
+): Promise<CollectedTurn | typeof SUPERSEDED | typeof TIMED_OUT> {
+  let pollTimer: ReturnType<typeof setTimeout> | null = null
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null
   let cancelled = false
-  const poll = new Promise<typeof SUPERSEDED>((resolve) => {
-    const tick = (): void => {
-      if (cancelled) return
-      if (isSuperseded(name, token)) {
-        resolve(SUPERSEDED)
-        return
-      }
-      setTimeout(tick, SUPERSEDE_POLL_MS)
-    }
-    setTimeout(tick, SUPERSEDE_POLL_MS)
-  })
+  const racers: Array<Promise<CollectedTurn | typeof SUPERSEDED | typeof TIMED_OUT>> = [turn]
+  if (token !== null) {
+    racers.push(
+      new Promise<typeof SUPERSEDED>((resolve) => {
+        const tick = (): void => {
+          if (cancelled) return
+          if (isSuperseded(name, token)) {
+            resolve(SUPERSEDED)
+            return
+          }
+          pollTimer = setTimeout(tick, SUPERSEDE_POLL_MS)
+        }
+        pollTimer = setTimeout(tick, SUPERSEDE_POLL_MS)
+      }),
+    )
+  }
+  if (timeoutMs !== null) {
+    racers.push(
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        timeoutTimer = setTimeout(() => resolve(TIMED_OUT), timeoutMs)
+      }),
+    )
+  }
   try {
-    return await Promise.race([turn, poll])
+    return await Promise.race(racers)
   } finally {
     cancelled = true
+    if (pollTimer !== null) clearTimeout(pollTimer)
+    if (timeoutTimer !== null) clearTimeout(timeoutTimer)
   }
 }
 
@@ -449,6 +473,11 @@ async function findActiveTurnWithRetry(
  * Claims `token` only after the steer lands (delivery), so a failed steer never
  * falsely retires the earlier send. A `review`/`compact` turn cannot be steered
  * — surface a recoverable failure pointing at a retry.
+ *
+ * After claiming, this send keeps watching the send-token: a yet-newer send (the
+ * 3rd, 4th, … of a burst) steers in and claims after it, so this one must also
+ * exit early on supersede. Otherwise every steerer past the first would survive
+ * and return the merged result, breaking "only the latest send survives".
  */
 async function collectSteeredTurn(
   client: CodexWsClient,
@@ -480,9 +509,17 @@ async function collectSteeredTurn(
     }
     throw e
   }
-  claimSendToken(req.name, token)
-  const outcome = await withTimeout(collector.awaitTurn(), req.timeoutMs)
-  if (isTimedOut(outcome)) return { kind: 'timed-out', elapsedMs: req.timeoutMs ?? 0 }
+  // A claim that fails to land must not make this send think it was superseded
+  // (the file would not hold our token), so it then waits without the poll.
+  const claimed = claimSendToken(req.name, token)
+  const outcome = await awaitTurnOrSupersede(
+    collector.awaitTurn(),
+    req.name,
+    claimed ? token : null,
+    req.timeoutMs,
+  )
+  if (outcome === TIMED_OUT) return { kind: 'timed-out', elapsedMs: req.timeoutMs ?? 0 }
+  if (outcome === SUPERSEDED) return supersedeEarlyExit(req.name)
   const rawPath = writeLastTurn(req.name, outcome.completed)
   touchLastSeen(req.name)
   return turnNotificationToResult(outcome.completed, {
@@ -884,34 +921,39 @@ export class CodexEngine implements Engine {
     }
 
     // ── Primary (lock holder) ──
-    // Claim a send token immediately, before delivering. A later send can only
-    // begin after it observes this held lock, and it claims only after its own
-    // steer lands — so this claim is guaranteed to precede the later one. When
-    // the later claim arrives, this send's `isSuperseded` check flips and it
-    // exits early (exit 0 + note) instead of collecting the merged turn.
-    const myToken = mintSendToken()
-    claimSendToken(req.name, myToken)
     let client: CodexWsClient | null = null
     try {
       client = await openInitializedCodexClient(req.name)
       const threadId = await resolveSendThread(client, req.name)
       // If a turn is already running on the main thread — this send won a lock an
-      // earlier send freed when it exited on supersede — join that turn rather
-      // than start a colliding `turn/start`.
+      // earlier send freed when it exited on supersede — join that turn as a
+      // steerer rather than start a colliding `turn/start`. As a joiner it claims
+      // only after its steer lands (inside `collectSteeredTurn`), per the
+      // delivery rule, so a failed steer never retires the send it joined.
       const existing = await readActiveTurnId(client, threadId)
       if (existing !== null) {
-        return await collectSteeredTurn(client, req, ctx, threadId, existing, myToken)
+        return await collectSteeredTurn(client, req, ctx, threadId, existing, mintSendToken())
       }
+      // This send starts the turn. Claim its token immediately before delivering:
+      // a later send can only steer once this `turn/start` has created the turn,
+      // so this claim is causally guaranteed to precede the later one. When the
+      // later claim lands, the supersede poll flips and this send exits early
+      // (exit 0 + note) instead of collecting the merged turn. A claim that fails
+      // to land yields a null token so this send waits without the poll.
+      const myToken = mintSendToken()
+      const claimed = claimSendToken(req.name, myToken)
       const collector = subscribeTurnCollection(client, threadId)
       await client.request<'turn/start', TurnStartResponse>('turn/start', {
         threadId,
         input: [{ type: 'text', text: req.prompt, text_elements: [] }],
       })
-      const outcome = await withTimeout(
-        awaitTurnOrSupersede(collector.awaitTurn(), req.name, myToken),
+      const outcome = await awaitTurnOrSupersede(
+        collector.awaitTurn(),
+        req.name,
+        claimed ? myToken : null,
         req.timeoutMs,
       )
-      if (isTimedOut(outcome)) return { kind: 'timed-out', elapsedMs: req.timeoutMs ?? 0 }
+      if (outcome === TIMED_OUT) return { kind: 'timed-out', elapsedMs: req.timeoutMs ?? 0 }
       if (outcome === SUPERSEDED) return supersedeEarlyExit(req.name)
       const rawPath = writeLastTurn(req.name, outcome.completed)
       touchLastSeen(req.name)
