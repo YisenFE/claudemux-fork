@@ -71,14 +71,21 @@ export interface InboundNotifierDeps {
  * comment-add repeats, so the key dedups duplicates while keeping distinct
  * comments distinct. Without this every doc-comment collapsed to the literal
  * `evt_`, so the first one to reach the queue deduped all later ones out.
+ *
+ * The composite is only used when both identifying fields are present — which
+ * the doc-comment handler always guarantees (its decoder drops an event it
+ * cannot resolve a file token and comment id from). A malformed or synthetic
+ * `doc_comment` meta missing them is not keyed on a degenerate
+ * `doc_comment:::root` (which would dedup distinct such events together); it
+ * falls through to the generic fallback instead.
  */
 export function defaultEventId(meta: Record<string, string>): string {
   if (meta.event_id) return meta.event_id
   if (meta.uuid) return meta.uuid
   if (meta.message_id) return meta.message_id
-  if (meta.kind === 'doc_comment') {
+  if (meta.kind === 'doc_comment' && meta.file_token && meta.comment_id) {
     const reply = meta.reply_id || 'root'
-    return `doc_comment:${meta.file_token ?? ''}:${meta.comment_id ?? ''}:${reply}`
+    return `doc_comment:${meta.file_token}:${meta.comment_id}:${reply}`
   }
   return `evt_${meta.create_time ?? ''}`
 }

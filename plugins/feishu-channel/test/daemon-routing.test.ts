@@ -98,6 +98,21 @@ describe('defaultEventId', () => {
     expect(defaultEventId({ create_time: '1716200000000' })).toBe('evt_1716200000000')
     expect(defaultEventId({})).toBe('evt_')
   })
+
+  // The real handler never emits a doc-comment meta without file_token +
+  // comment_id (the decoder drops an event it cannot resolve those from). This
+  // guards a synthetic / partial meta: it must NOT be keyed on a degenerate
+  // composite like `doc_comment:::root`, which would dedup distinct malformed
+  // events against each other.
+  test('a doc-comment meta missing its identifiers does not collapse to a degenerate composite', () => {
+    expect(defaultEventId({ kind: 'doc_comment' })).not.toBe('doc_comment:::root')
+    expect(defaultEventId({ kind: 'doc_comment', file_token: 'docA' })).not.toBe(
+      'doc_comment:docA::root',
+    )
+    expect(defaultEventId({ kind: 'doc_comment', comment_id: 'cmt_1' })).not.toBe(
+      'doc_comment::cmt_1:root',
+    )
+  })
 })
 
 describe('createInboundNotifier', () => {
