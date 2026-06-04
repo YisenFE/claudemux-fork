@@ -22,6 +22,7 @@ import type {
   TurnSteerResponse,
 } from '../../codex-protocol/v2/index.js'
 import { daemonAlive, readDaemonState } from './supervisor.js'
+import { readActiveTurnId, steerActiveTurn } from './steer.js'
 import { CodexWsClient } from './rpc.js'
 import {
   CodexUiIpcClient,
@@ -365,19 +366,9 @@ export class CodexIpcBridge {
     const steerParams = turnSteerParamsFromFollower(
       params,
       threadId,
-      await this.readActiveTurnId(client, threadId),
+      await readActiveTurnId(client, threadId),
     )
-    let response: TurnSteerResponse
-    try {
-      response = await client.request<'turn/steer', TurnSteerResponse>('turn/steer', steerParams)
-    } catch (e) {
-      const actualTurnId = expectedActiveTurnIdFromError(e)
-      if (actualTurnId === null) throw e
-      response = await client.request<'turn/steer', TurnSteerResponse>('turn/steer', {
-        ...steerParams,
-        expectedTurnId: actualTurnId,
-      })
-    }
+    const response = await steerActiveTurn(client, steerParams)
     this.scheduleSnapshot()
     return { result: response }
   }
@@ -386,7 +377,7 @@ export class CodexIpcBridge {
     const client = await this.requireAppClient()
     const threadId = this.requireThreadId()
     this.resolvePendingServerRequestsForInterrupt()
-    const activeTurnId = await this.readActiveTurnId(client, threadId)
+    const activeTurnId = await readActiveTurnId(client, threadId)
     if (activeTurnId === null) {
       this.scheduleSnapshot()
       return { ok: true }
@@ -483,14 +474,6 @@ export class CodexIpcBridge {
   private requireThreadId(): string {
     if (this.activeThreadId === null) throw new Error('codex teammate has no active thread')
     return this.activeThreadId
-  }
-
-  private async readActiveTurnId(client: CodexWsClient, threadId: string): Promise<string | null> {
-    const read = await client.request<'thread/read', ThreadReadResponse>('thread/read', {
-      threadId,
-      includeTurns: true,
-    })
-    return activeTurnIdFromThread(read.thread)
   }
 
   private scheduleSnapshot(): void {
@@ -753,14 +736,6 @@ function interruptServerRequestResult(method: ServerRequest['method']): unknown 
   }
 }
 
-function activeTurnIdFromThread(thread: Thread): string | null {
-  for (let i = thread.turns.length - 1; i >= 0; i -= 1) {
-    const turn = thread.turns[i]
-    if (turn?.status === 'inProgress') return turn.id
-  }
-  return null
-}
-
 function notificationMatchesThread(notif: ServerNotification, threadId: string | null): boolean {
   if (threadId === null) return false
   const params = asRecord(notif.params)
@@ -822,11 +797,6 @@ function followerResponsesapiMetadata(
   return restoreMessage === null || !('responsesapiClientMetadata' in restoreMessage)
     ? { present: false }
     : { present: true, value: restoreMessage['responsesapiClientMetadata'] }
-}
-
-function expectedActiveTurnIdFromError(error: unknown): string | null {
-  const match = errorMessage(error).match(/expected active turn id `[^`]+` but found `([^`]+)`/)
-  return match?.[1] ?? null
 }
 
 function secondsToMillis(value: number): number {
