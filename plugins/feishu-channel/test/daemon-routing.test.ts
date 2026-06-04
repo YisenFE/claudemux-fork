@@ -60,6 +60,59 @@ describe('defaultEventId', () => {
     expect(defaultEventId({ uuid: 'u', message_id: 'm' })).toBe('u')
     expect(defaultEventId({ message_id: 'm' })).toBe('m')
   })
+
+  // A doc-comment meta carries none of event_id/uuid/message_id, so the key
+  // must come from the comment's own identifiers. Without this, every
+  // doc-comment collapsed to the same literal `evt_` and silently deduped
+  // distinct comments out of the durable queue.
+  test('derives a unique key for a doc-comment from its own identifiers', () => {
+    const key = defaultEventId({
+      kind: 'doc_comment',
+      file_token: 'docABC',
+      comment_id: 'cmt_1',
+    })
+    expect(key).toBe('doc_comment:docABC:cmt_1:root')
+    expect(key).not.toBe('evt_')
+  })
+
+  test('a doc-comment reply keys on its reply_id, distinct from the root comment', () => {
+    const root = defaultEventId({ kind: 'doc_comment', file_token: 'docABC', comment_id: 'cmt_1' })
+    const reply = defaultEventId({
+      kind: 'doc_comment',
+      file_token: 'docABC',
+      comment_id: 'cmt_1',
+      reply_id: 'rpl_9',
+    })
+    expect(reply).toBe('doc_comment:docABC:cmt_1:rpl_9')
+    expect(reply).not.toBe(root)
+  })
+
+  test('distinct doc-comments on different docs or comments get distinct keys', () => {
+    const a = defaultEventId({ kind: 'doc_comment', file_token: 'docA', comment_id: 'cmt_1' })
+    const b = defaultEventId({ kind: 'doc_comment', file_token: 'docB', comment_id: 'cmt_1' })
+    const c = defaultEventId({ kind: 'doc_comment', file_token: 'docA', comment_id: 'cmt_2' })
+    expect(new Set([a, b, c]).size).toBe(3)
+  })
+
+  test('a truly unkeyable event still falls back to the create_time-stamped id', () => {
+    expect(defaultEventId({ create_time: '1716200000000' })).toBe('evt_1716200000000')
+    expect(defaultEventId({})).toBe('evt_')
+  })
+
+  // The real handler never emits a doc-comment meta without file_token +
+  // comment_id (the decoder drops an event it cannot resolve those from). This
+  // guards a synthetic / partial meta: it must NOT be keyed on a degenerate
+  // composite like `doc_comment:::root`, which would dedup distinct malformed
+  // events against each other.
+  test('a doc-comment meta missing its identifiers does not collapse to a degenerate composite', () => {
+    expect(defaultEventId({ kind: 'doc_comment' })).not.toBe('doc_comment:::root')
+    expect(defaultEventId({ kind: 'doc_comment', file_token: 'docA' })).not.toBe(
+      'doc_comment:docA::root',
+    )
+    expect(defaultEventId({ kind: 'doc_comment', comment_id: 'cmt_1' })).not.toBe(
+      'doc_comment::cmt_1:root',
+    )
+  })
 })
 
 describe('createInboundNotifier', () => {

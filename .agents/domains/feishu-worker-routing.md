@@ -684,8 +684,14 @@ a small pure function; that unit-test surface is the guarantee's enforcement.
   the holder can extract it through a **pure local decode** (no network call),
   as §5 requires for the 3 s ack budget.
 - **`event_id` extraction.** §4 names inbox files `<ts_ns>-<event_id>.json` and
-  §5 dedups on `event_id` / `message_id`. Confirm every routed event type
-  carries a stable id extractable by pure local decode.
+  §5 dedups on `event_id` / `message_id`. Confirmed against the current durable
+  queue: `im.message.receive_v1` carries `message_id`, but
+  `drive.notice.comment_add_v1` exposes no stable per-event id in its decoded
+  meta. The current queue keys a doc-comment on the composite
+  `doc_comment:<file_token>:<comment_id>:<reply_id|root>` instead
+  (`daemon-routing.ts` `defaultEventId`), derived from the §12 comment-reply
+  meta contract. A worker-routing inbox must do the same — it cannot name a
+  doc-comment file `<ts_ns>-<event_id>.json`.
 - **Feishu un-acked replay window.** §10.6 leans on Feishu redelivering
   un-acked events. Confirm the replay window and whether it covers a realistic
   holder-handoff gap.

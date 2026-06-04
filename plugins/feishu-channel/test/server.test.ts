@@ -139,16 +139,31 @@ describe('handleEvent — dispatch', () => {
     expect(logErrors).toHaveLength(0)
   })
 
-  test('a notifier that throws is caught — handleEvent never rejects', async () => {
+  test('a persistence-failed notify propagates so the event is not ACKed', async () => {
+    // `notify` is the durable write (createDurableNotifier persists, then routes,
+    // and throws only when the durable write fails). handleEvent must NOT swallow
+    // that: it propagates so the Feishu SDK rejects the event (HTTP 500) and
+    // Feishu redelivers it, rather than ACKing an event that was never persisted.
     writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
-    const logErrors: string[] = []
-    const core = makeCore(new FakeTransport(), [], logErrors, () => {
-      throw new Error('notify blew up')
+    const core = makeCore(new FakeTransport(), [], [], () => {
+      throw new Error('disk full')
     })
 
-    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent())
+    await expect(core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent())).rejects.toThrow('disk full')
+  })
 
-    expect(logErrors.some((m) => m.includes('deliver'))).toBe(true)
+  test('a received-reaction failure after a successful notify does not reject', async () => {
+    // The event is already delivered and durable; only the best-effort
+    // received indicator fails. That must stay best-effort — propagating it
+    // would make Feishu redeliver an event that is already safely persisted.
+    writeAccess({ dmPolicy: 'allowlist', allowFrom: ['ou_sender'] })
+    const notes: Note[] = []
+    const transport = new FakeTransport()
+    transport.failOn = 'addReaction'
+    const core = makeCore(transport, notes)
+
+    await expect(core.handleEvent(IM_MESSAGE_EVENT_TYPE, rawImEvent())).resolves.toBeUndefined()
+    expect(notes).toHaveLength(1)
   })
 
   test('a malformed payload for a known event type is dropped, not thrown', async () => {
@@ -254,7 +269,11 @@ describe('bot-discovery commit runs only after a successful notify', () => {
       throw new Error('notify failed')
     })
 
-    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, groupMention())
+    // The failure propagates (the event is not ACKed), and the baseline is left
+    // un-injected so the next mention re-arms it.
+    await expect(
+      core.handleEvent(IM_MESSAGE_EVENT_TYPE, groupMention()),
+    ).rejects.toThrow('notify failed')
 
     expect(readChatBots(dir, transport.appId, 'oc_grp').baselineInjectedAt).toBeNull()
     expect(readChatBots(dir, transport.appId, 'oc_grp').needsBaselineOnNextMention).toBe(true)
@@ -318,7 +337,11 @@ describe('/introduce backfill after baseline → incremental delta', () => {
     })
 
     await core.handleEvent(IM_MESSAGE_EVENT_TYPE, introduceByHuman())
-    await core.handleEvent(IM_MESSAGE_EVENT_TYPE, mentionByHuman('om_next'))
+    // The mention delivers, but its notify fails — the failure propagates and
+    // the introduced bot stays pending for the next mention's delta.
+    await expect(
+      core.handleEvent(IM_MESSAGE_EVENT_TYPE, mentionByHuman('om_next')),
+    ).rejects.toThrow('notify failed')
 
     expect(readChatBots(dir, transport.appId, 'oc_grp').pendingNewBots).toContain('ou_peer')
   })
