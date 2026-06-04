@@ -128,6 +128,7 @@ export async function startDaemon(deps: StartDaemonDeps): Promise<StartDaemonRes
     generation: deps.generation,
     route,
     now: deps.now ?? Date.now,
+    logError: deps.logError,
   })
 
   const core = createChannelCore({
@@ -275,14 +276,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function createDurableNotifier(deps: {
+export function createDurableNotifier(deps: {
   queue: InboundQueue
   generation: number
   now(): number
   route(content: string, meta: Record<string, string>): boolean
+  logError?(message: string, err?: unknown): void
 }): (content: string, meta: Record<string, string>) => void {
   return (content, meta) => {
     const eventId = defaultEventId(meta)
+    // Persist first. The durable write is the boundary the Feishu ACK is
+    // allowed past, so a write failure must propagate: the caller lets the
+    // Feishu SDK reject the event and Feishu redelivers it rather than losing
+    // it. (See server.ts handleEvent, which does not swallow this.)
     deps.queue.enqueue({
       eventId,
       content,
@@ -290,7 +296,14 @@ function createDurableNotifier(deps: {
       receivedAt: deps.now(),
       byGeneration: deps.generation,
     })
-    deps.route(content, meta)
+    // Deliver best-effort. The row is already durable, so a proxy delivery
+    // failure is logged and left for replay — it must not surface as a
+    // persistence failure, which would trigger a redundant Feishu redelivery.
+    try {
+      deps.route(content, meta)
+    } catch (err) {
+      deps.logError?.('failed to route a persisted inbound event to a proxy', err)
+    }
   }
 }
 

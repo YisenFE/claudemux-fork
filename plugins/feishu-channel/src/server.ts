@@ -105,7 +105,15 @@ export function pickReceivedReactionEmoji(): string {
  */
 export const CLEARED_TOMBSTONE_CAP = 1024
 
-/** Pushes one inbound event to the Claude session. */
+/**
+ * Pushes one inbound event to the Claude session. The daemon wires this to a
+ * durable notifier that persists the event before routing it to a proxy.
+ *
+ * A thrown error means the durable write failed: the event is not safely
+ * recorded. `handleEvent` lets it propagate so the Feishu SDK rejects the
+ * event and Feishu redelivers it. A mere proxy-delivery failure does not
+ * throw — the event is persisted and replays later.
+ */
 export type ChannelNotifier = (
   content: string,
   meta: Record<string, string>,
@@ -358,19 +366,24 @@ export function createChannelCore(deps: ChannelCoreDeps): ChannelCore {
     }
 
     logInfo(`${eventType} gated through — delivering (message ${messageId})`)
+    // Persisting the inbound event is the durability boundary: it must succeed
+    // before the Feishu SDK is allowed to ACK. `notify` throws only when the
+    // durable write fails, so let that propagate — the SDK then rejects the
+    // event, Feishu redelivers it, and a never-persisted event is not lost.
+    // (A proxy-delivery failure does not throw here: the row is persisted and
+    // replays to a proxy later.)
+    await deps.notify(delivery.content, delivery.meta)
     try {
-      await deps.notify(delivery.content, delivery.meta)
-      // The notification reached the session, so any one-shot state the handler
-      // staged (e.g. a bot-discovery baseline marked as injected) can now be
-      // committed. Reached only after a successful notify, so a delivery
-      // failure leaves that state intact to retry on the next message.
+      // The event is durably queued, so any one-shot state the handler staged
+      // (e.g. a bot-discovery baseline marked as injected) can now be committed,
+      // and the source message marked received so the Feishu sender sees it
+      // landed. Both are best-effort: the event is already safe, so a failure
+      // here is logged, never propagated — propagating would make Feishu
+      // redeliver an event that was persisted and delivered.
       if (delivery.commit) await delivery.commit()
-      // The event is now in the session's context — mark the source message
-      // as received so the Feishu sender sees it landed. `markReceived`
-      // swallows its own failures, so it never reaches the catch below.
       await markReceived(delivery.meta)
     } catch (err) {
-      logError(`failed to deliver a ${eventType} notification`, err)
+      logError(`failed to finalize a ${eventType} notification`, err)
     }
   }
 
