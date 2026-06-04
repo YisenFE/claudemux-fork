@@ -23,10 +23,13 @@
 #      actually runs *in* that directory. Gates 1–2 are the cheap fast-path
 #      and defense-in-depth; gate 3 is what makes "dispatcher-only" true.
 #
-# This hook ships in the plugin's hooks.json (like the other four), so the
-# `${CLAUDE_PLUGIN_ROOT}` path is re-resolved to the current plugin version on
-# every launch. It calls `tm` by PATH (Claude Code prepends each plugin's
-# bin/ to PATH) — never an absolute, version-pinned plugin path.
+# `tm` is resolved version-coherently: prefer `${CLAUDE_PLUGIN_ROOT}/bin/tm`,
+# which Claude Code re-resolves to the current plugin version at every launch,
+# and fall back to `tm` on PATH only when that is missing. The absolute form
+# keeps resolving when the plugin's bin/ has dropped off PATH — a drift seen
+# after a plugin version change reloads plugins mid-session, where a PATH-only
+# lookup would silently fail this hook into injecting nothing. When neither
+# resolves, the hook no-ops like every other failure mode.
 #
 # SessionStart hook failures show their stderr to the user on every session
 # start, so every failure mode here degrades to a silent `exit 0` with no
@@ -51,10 +54,13 @@ dispatcher_real="$(resolve_dir "$TM_DISPATCHER_DIR")"
 cwd_real="$(resolve_dir "$hook_cwd")"
 [[ -n "$dispatcher_real" && "$cwd_real" == "$dispatcher_real" ]] || exit 0
 
-# Required tools, both guarded: `tm` provides the history, `jq` builds the
-# JSON with correct string escaping (history intent/name fields are arbitrary
-# user text — quotes, backslashes, newlines, unicode). Missing either → no-op.
-command -v tm >/dev/null 2>&1 || exit 0
+# Required tools: `tm` provides the history, `jq` builds the JSON with correct
+# string escaping (history intent/name fields are arbitrary user text — quotes,
+# backslashes, newlines, unicode). Resolve `tm` per the header: the version-
+# coherent `${CLAUDE_PLUGIN_ROOT}/bin/tm` first, then PATH, else no-op. `jq` is
+# a system tool, not a plugin binary, so it stays a plain PATH lookup.
+TM="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/bin/tm}"
+[ -x "$TM" ] || TM="$(command -v tm)" || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 
 # Recent window. --oneline is the compact one-row-per-session shape
@@ -63,7 +69,7 @@ command -v jq >/dev/null 2>&1 || exit 0
 RECALL_SINCE="3d"
 RECALL_LIMIT=50
 
-history_text="$(tm history --since "$RECALL_SINCE" --oneline --limit "$RECALL_LIMIT" 2>/dev/null)" || exit 0
+history_text="$("$TM" history --since "$RECALL_SINCE" --oneline --limit "$RECALL_LIMIT" 2>/dev/null)" || exit 0
 
 # Nothing recent (or `tm history` printed nothing) → no context worth adding.
 [[ -n "$history_text" ]] || exit 0

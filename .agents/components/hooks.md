@@ -97,13 +97,14 @@ path (every compaction re-fires SessionStart and refreshes the recall).
   vs a physical cwd `/data00/home/u/dev` — still matches; weakening this to a
   literal string compare would reject such a dispatcher forever. Any other
   session no-ops.
-- **`tm` by PATH, never an absolute plugin path.** The script calls bare `tm`
-  (Claude Code prepends each plugin's `bin/` to PATH) and ships in the
-  plugin's `hooks.json`, so the `${CLAUDE_PLUGIN_ROOT}` wiring re-resolves to
-  the current plugin version every launch. Writing a version-pinned plugin
-  path into a settings.json hook would 404 after the next plugin update — and
-  a SessionStart hook failure surfaces its stderr to the user on every session
-  start (below). See
+- **`tm` resolved via `${CLAUDE_PLUGIN_ROOT}/bin/tm`, then PATH.** The script
+  prefers the plugin-root path and falls back to bare `tm` on PATH, no-opping
+  if neither resolves. `${CLAUDE_PLUGIN_ROOT}` — which Claude Code re-resolves
+  to the current plugin version every launch, and which also wires the hook in
+  the plugin's `hooks.json` — keeps the absolute form version-coherent and
+  resolving even when a mid-session plugin reload drops the plugin's `bin/` off
+  PATH, where a PATH-only lookup would silently inject nothing. `jq` is a system
+  tool, so it stays a plain PATH lookup. See
   [decision dispatcher-sessionstart-recall](/.agents/decisions/dispatcher-sessionstart-recall.md).
 - **Bounded, newest-first.** `tm history --since 3d --oneline --limit 50`,
   then a 9000-character budget (Claude Code measures the `additionalContext`
